@@ -1,0 +1,68 @@
+# WHITELIST .gitignore. Do not change this to a normal ignore list (AGENTS.md rule 2).
+#
+# Step 1: ignore everything at the top level. This includes the 82 GB
+# "Battlefield 1 Files" install, .claude/, target/ and any extracted data.
+# Git never looks inside an ignored folder, so nothing below can re-add game files.
+/*
+
+# Step 2: allow the top-level files of the project.
+!/.gitignore
+!/.gitattributes
+!/AGENTS.md
+!/README.md
+!/MODDING_PLAN.md
+!/MODLOG.md
+!/MODLOG-template.md
+!/STATUS.md
+!/STATUS-handoff.md
+!/CREDITS.md
+!/NOTICE
+!/LICENSE-MIT
+!/LICENSE-APACHE
+!/LICENSE
+!/Cargo.toml
+!/Cargo.lock
+!/rust-toolchain.toml
+!/rustfmt.toml
+!/clippy.toml
+
+# Step 3: allow the source folders.
+!/.cargo/
+!/crates/
+!/docs/
+!/tools/
+!/xtask/
+
+# Step 4: inside those folders, ignore every file, keep the sub-folders,
+# then allow only source file types.
+/*/**
+!/*/**/
+!*.rs
+!*.toml
+!*.md
+!*.wgsl
+!*.py
+!*.ps1
+!*.sh
+!LICENSE*
+
+# Step 5: safety net. Never track game data or build output, even inside an allowed folder.
+target/
+*.cas
+*.cat
+*.sb
+*.toc
+*.ebx
+*.res
+*.chunk
+*.dds
+*.exe
+*.dll
+initfs_*
+
+# Step 6: the empty "Battlefield 1 Files" folder, where users put their own
+# Data and Patch folders. Only its note file is tracked; git ignores
+# everything else inside and never looks into Data or Patch.
+!/Battlefield 1 Files/
+/Battlefield 1 Files/**
+!/Battlefield 1 Files/PUT_DATA_AND_PATCH_HERE.md

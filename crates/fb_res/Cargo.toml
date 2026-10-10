@@ -1,0 +1,10 @@
+[package]
+name = "fb_res"
+description = "Frostbite (Battlefield 1) mesh and texture resources"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true

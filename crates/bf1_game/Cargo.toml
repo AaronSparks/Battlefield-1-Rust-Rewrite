@@ -1,0 +1,17 @@
+[package]
+name = "bf1_game"
+description = "Walk around a Battlefield 1 level, read from the user's own install"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fb_vfs.workspace = true
+fb_ebx.workspace = true
+fb_level.workspace = true
+fb_res.workspace = true
+fb_terrain.workspace = true
+bevy = "0.19.1"
+texture2ddecoder = "0.1"

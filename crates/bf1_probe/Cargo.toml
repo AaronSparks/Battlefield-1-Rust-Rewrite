@@ -1,0 +1,20 @@
+[package]
+name = "bf1_probe"
+description = "Command-line tool that prints and logs what fb_vfs finds in the install"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fb_vfs.workspace = true
+fb_ebx.workspace = true
+fb_level.workspace = true
+fb_res.workspace = true
+fb_terrain.workspace = true
+glam = "0.30"
+texture2ddecoder = "0.1"
+png = "0.17"
+# Reads the user's reference screenshots (WebP) for image-stats; MIT OR Apache-2.0.
+image-webp = "0.2"

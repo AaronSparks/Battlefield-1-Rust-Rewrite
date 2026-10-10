@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/fb_vfs", "crates/fb_ebx", "crates/fb_level", "crates/fb_res", "crates/fb_terrain", "crates/bf1_probe", "crates/bf1_game"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Unlicense"
+
+[workspace.dependencies]
+anyhow = "1"
+fb_vfs = { path = "crates/fb_vfs" }
+fb_ebx = { path = "crates/fb_ebx" }
+fb_level = { path = "crates/fb_level" }
+fb_res = { path = "crates/fb_res" }
+fb_terrain = { path = "crates/fb_terrain" }
+
+# Bevy is slow without optimisation; optimise dependencies even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3

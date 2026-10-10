@@ -1,0 +1,11 @@
+[package]
+name = "fb_terrain"
+description = "Battlefield 1 terrain heights from the terrain streaming tree"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+texture2ddecoder = "0.1"

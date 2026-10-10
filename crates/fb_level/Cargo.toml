@@ -1,0 +1,13 @@
+[package]
+name = "fb_level"
+description = "Walk a Frostbite level's EBX data and collect placed meshes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fb_vfs.workspace = true
+fb_ebx.workspace = true
+glam = "0.30"
