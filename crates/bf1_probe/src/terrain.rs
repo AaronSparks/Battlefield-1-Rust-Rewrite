@@ -587,6 +587,49 @@ pub fn cmd_terrain(log: &mut Log, root: &std::path::Path, superbundle: &str, lev
 
 /// `terrain-table`: print every chunk table record with its flags, size, and
 /// (for height tiles) level and position.
+/// Ground layers around a point: the share of each layer (sum of mask
+/// weights) in a square of `radius` metres, and a map of the strongest layer
+/// per `step` metres (rows = z rising, columns = x rising; '.' = none).
+pub fn cmd_layer_grid(log: &mut Log, root: &std::path::Path, superbundle: &str, x: f32, z: f32, radius: f32, step: f32) -> Result<()> {
+    let mut fs = GameFs::open(root)?;
+    fs.index_toc_chunks()?;
+    let world = fb_level::World::load(&fs, &[superbundle])?;
+    let (terrain, _) = load_terrain(&fs, &world)?;
+    let lm = terrain.layers.as_ref().context("no layer masks")?;
+    let skip = [false; fb_terrain::layers::MAX_LAYERS];
+    let mut w = [0f32; fb_terrain::layers::MAX_LAYERS];
+    let mut share = [0f64; fb_terrain::layers::MAX_LAYERS];
+    let mut levels: BTreeMap<u32, usize> = BTreeMap::new();
+    let n = (2.0 * radius / step).round() as i32;
+    let mut rows = Vec::new();
+    for j in 0..=n {
+        let mut row = String::new();
+        for i in 0..=n {
+            let (px, pz) = (x - radius + i as f32 * step, z - radius + j as f32 * step);
+            match lm.weights_at(px, pz, &skip, &mut w) {
+                Some(level) => {
+                    *levels.entry(level).or_default() += 1;
+                    for (s, v) in share.iter_mut().zip(&w) {
+                        *s += f64::from(*v);
+                    }
+                    let best = (0..w.len()).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap();
+                    row.push_str(&if w[best] > 0.0 { format!("{best:>3}") } else { "  .".into() });
+                }
+                None => row.push_str("  -"),
+            }
+        }
+        rows.push(row);
+    }
+    let total: f64 = share.iter().sum();
+    let list: Vec<String> = share.iter().enumerate().filter(|(_, s)| **s > 0.0).map(|(l, s)| format!("layer {l}: {:.1}%", 100.0 * s / total.max(1e-9))).collect();
+    log.line(format!("terrain height at ({x}, {z}): {:?}", terrain.height_at(x, z)));
+    log.line(format!("layers within {radius} m of ({x}, {z}), {step} m grid: {}; mask level used {levels:?}", list.join(", ")));
+    for (j, r) in rows.iter().enumerate() {
+        log.line(format!("  z {:>7.1}: {r}", z - radius + j as f32 * step));
+    }
+    Ok(())
+}
+
 pub fn cmd_terrain_table(log: &mut Log, root: &std::path::Path, superbundle: &str) -> Result<()> {
     let mut fs = GameFs::open(root)?;
     fs.index_toc_chunks()?;

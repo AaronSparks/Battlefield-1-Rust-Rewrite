@@ -81,7 +81,7 @@ fn main() {
         .init_resource::<inspect::InspectResult>()
         .add_systems(Startup, overlay::spawn_overlay)
         .add_systems(Update, (inspect::inspect_key, overlay::toggle_overlay, overlay::update_overlay).chain())
-        .add_systems(Update, scatter::update_scatter)
+        .add_systems(Update, (scatter::update_scatter, scatter::face_cards))
         .run();
 }
 
@@ -197,7 +197,8 @@ fn spawn_level(
         }
         let mut verts = Vec::new();
         let mut tris = Vec::new();
-        for p in &m.parts {
+        // Decals lie on other surfaces (some float a little above them): not solid.
+        for p in m.parts.iter().filter(|p| p.decal.is_none()) {
             let base = verts.len() as u32;
             verts.extend(p.positions.iter().map(|v| Vec3::from(*v)));
             tris.extend(p.indices.chunks_exact(3).map(|t| [base + t[0], base + t[1], base + t[2]]));
@@ -249,6 +250,8 @@ fn spawn_level(
     // Mesh materials: one per texture, plus a grey one for parts without a texture.
     let grey = materials.add(StandardMaterial { base_color: Color::srgb(0.6, 0.6, 0.6), perceptual_roughness: 0.9, ..default() });
     let texture_images: Vec<Handle<Image>> = level.textures.iter().map(|t| images.add(make_image(t))).collect();
+    // Test switch: BF1_CUTOUT=<alpha> sets the cut-out threshold of leaf cards (default 0.5).
+    let cutout = std::env::var("BF1_CUTOUT").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.5);
     let texture_materials: Vec<Handle<StandardMaterial>> = level
         .textures
         .iter()
@@ -260,7 +263,7 @@ fn spawn_level(
                 materials.add(StandardMaterial {
                     base_color_texture: Some(img),
                     perceptual_roughness: 0.85,
-                    alpha_mode: AlphaMode::Mask(0.5),
+                    alpha_mode: AlphaMode::Mask(cutout),
                     cull_mode: None,
                     double_sided: true,
                     ..default()
@@ -290,11 +293,32 @@ fn spawn_level(
     // BF1_DETAIL=off draws building parts without their detail texture (to compare).
     let details_on = std::env::var("BF1_DETAIL").map_or(true, |v| v != "off");
     let mut detailed: std::collections::HashMap<(usize, usize, usize), PartMaterial> = std::collections::HashMap::new();
+    // Decal materials by (texture, opacity and colour multiplier bits). The
+    // depth bias keeps a decal in front of the surface it lies on;
+    // `BF1_DECAL_BIAS=<n>` overrides it (wgpu constant bias units).
+    let decal_bias = std::env::var("BF1_DECAL_BIAS").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(100.0);
+    let mut decal_materials: std::collections::HashMap<(usize, [u32; 4]), Handle<StandardMaterial>> = std::collections::HashMap::new();
     // Scatter mesh names, before the meshes move to the GPU.
     let scatter_labels: Vec<String> = level
         .scatter
         .iter()
         .map(|st| format!("L{} T{} {}", st.layer, st.identifier, level.meshes[st.mesh].name.rsplit('/').next().unwrap_or("").trim_end_matches("_mesh")))
+        .collect();
+    // Scatter meshes that are one flat card (a quad): the turn of the card's
+    // face about the vertical axis, so the card can face the camera.
+    let scatter_cards: Vec<Option<f32>> = level
+        .scatter
+        .iter()
+        .map(|st| {
+            let parts = &level.meshes[st.mesh].parts;
+            let [p] = parts.as_slice() else { return None };
+            if p.positions.len() != 4 || p.indices.len() < 3 {
+                return None;
+            }
+            let v = |i: usize| Vec3::from(p.positions[p.indices[i] as usize]);
+            let n = (v(1) - v(0)).cross(v(2) - v(0));
+            (n.x.hypot(n.z) > 0.5 * n.length()).then(|| n.x.atan2(n.z))
+        })
         .collect();
     let parts: Vec<Vec<PartGpu>> = level
         .meshes
@@ -307,6 +331,27 @@ fn spawn_level(
                         return PartGpu::TerrainColoured(p);
                     }
                     let material = match (p.texture, p.colour) {
+                        (Some(i), _) if p.decal.is_some() => {
+                            let d = p.decal.expect("checked");
+                            let key = (i, [d.opacity.to_bits(), d.multiply[0].to_bits(), d.multiply[1].to_bits(), d.multiply[2].to_bits()]);
+                            PartMaterial::Decal(
+                                decal_materials
+                                    .entry(key)
+                                    .or_insert_with(|| {
+                                        materials.add(StandardMaterial {
+                                            base_color: Color::linear_rgba(d.multiply[0], d.multiply[1], d.multiply[2], d.opacity),
+                                            base_color_texture: Some(texture_images[i].clone()),
+                                            perceptual_roughness: 0.85,
+                                            alpha_mode: AlphaMode::Blend,
+                                            depth_bias: decal_bias,
+                                            cull_mode: None,
+                                            double_sided: true,
+                                            ..default()
+                                        })
+                                    })
+                                    .clone(),
+                            )
+                        }
                         (Some(i), _) if p.detail.is_some() && details_on => {
                             let d = p.detail.expect("checked");
                             detailed
@@ -384,17 +429,23 @@ fn spawn_level(
 
     // Terrain mesh scattering (scatter.rs). BF1_SCATTER=off leaves it out.
     if std::env::var("BF1_SCATTER").map_or(true, |v| v != "off") && !level.scatter.is_empty() {
+        // Backdrop trees stand 0.5 to 2 km out, but their stored distances
+        // are 500 and 30 m (DESIGN.md "backdrop trees on the far hills"). Our
+        // rule: kinds with "backdrop" in the mesh name reach the whole map.
+        let backdrop_distance = std::env::var("BF1_BACKDROP_DISTANCE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(6000.0);
         let kinds: Vec<scatter::ScatterKind> = level
             .scatter
             .iter()
             .zip(&scatter_labels)
-            .map(|(st, label)| scatter::ScatterKind {
+            .zip(&scatter_cards)
+            .map(|((st, label), card)| scatter::ScatterKind {
                 label: label.clone(),
                 layer: st.layer as usize,
                 density: st.density,
                 min_scale: st.min_scale,
                 max_scale: st.max_scale,
-                distance: st.distance,
+                distance: if label.contains("backdrop") { backdrop_distance } else { st.distance },
+                card_facing: *card,
                 parts: parts[st.mesh]
                     .iter()
                     .filter_map(|p| match p {
@@ -415,20 +466,89 @@ fn spawn_level(
             }
         }
         log.line(format!("scatter: {} kinds ready", kinds.len()));
+        for k in kinds.iter().filter(|k| k.label.contains("backdrop") || k.card_facing.is_some()) {
+            log.line(format!(
+                "  scatter {}: draw distance {:.0} m (backdrop rule), {}",
+                k.label,
+                k.distance,
+                if k.card_facing.is_some() { "one card, faces the camera" } else { "not one card" }
+            ));
+        }
+        // Where the scatter layers are: covered area (sum of mask weights,
+        // whole map on an 8 m grid) by distance from the level centre.
+        if let Some(masks) = level.terrain.layers.as_ref() {
+            const RINGS: [f32; 5] = [250.0, 500.0, 1000.0, 2000.0, f32::MAX];
+            let mut used: Vec<usize> = kinds.iter().map(|k| k.layer).collect();
+            used.sort();
+            used.dedup();
+            const GRID: usize = 16;
+            let mut area = vec![[0.0f64; RINGS.len()]; fb_terrain::layers::MAX_LAYERS];
+            // Coarse map: hectares per cell of a 16 x 16 grid over the map.
+            let mut map = vec![[[0.0f64; GRID]; GRID]; fb_terrain::layers::MAX_LAYERS];
+            let mut w = [0.0f32; fb_terrain::layers::MAX_LAYERS];
+            let step = 8.0f32;
+            let n = (masks.width / step) as i32;
+            for iz in 0..n {
+                for ix in 0..n {
+                    let (x, z) = (masks.min[0] + (ix as f32 + 0.5) * step, masks.min[1] + (iz as f32 + 0.5) * step);
+                    if masks.weights_at(x, z, &[false; fb_terrain::layers::MAX_LAYERS], &mut w).is_none() {
+                        continue;
+                    }
+                    let d = (x - level.centre[0]).hypot(z - level.centre[2]);
+                    let ring = RINGS.iter().position(|&r| d < r).unwrap_or(RINGS.len() - 1);
+                    let (gx, gz) = (ix as usize * GRID / n as usize, iz as usize * GRID / n as usize);
+                    for &l in &used {
+                        area[l][ring] += f64::from(w[l]) * f64::from(step * step) / 1e6;
+                        map[l][gz][gx] += f64::from(w[l]) * f64::from(step * step) / 1e4;
+                    }
+                }
+            }
+            let cell = masks.width / GRID as f32;
+            let grid_of = |x: f32, z: f32| (((x - masks.min[0]) / cell) as i32, ((z - masks.min[1]) / cell) as i32);
+            log.line(format!(
+                "  scatter map: {GRID} x {GRID} cells of {cell:.0} m from x {:.0}, z {:.0} (rows = z rising, columns = x rising); level centre in cell {:?}",
+                masks.min[0],
+                masks.min[1],
+                grid_of(level.centre[0], level.centre[2])
+            ));
+            for &l in &used {
+                let rings: Vec<String> = area[l].iter().map(|a| format!("{a:.3}")).collect();
+                let names: Vec<&str> = kinds.iter().filter(|k| k.layer == l).map(|k| k.label.as_str()).collect();
+                log.line(format!(
+                    "  scatter layer {l:>2} cover: {:.3} km2; by distance from the centre (<250, <500, <1000, <2000, more m): [{}] km2; kinds {names:?}",
+                    area[l].iter().sum::<f64>(),
+                    rings.join(", ")
+                ));
+                if area[l].iter().sum::<f64>() > 0.01 {
+                    for (gz, row) in map[l].iter().enumerate() {
+                        let cells: Vec<String> = row.iter().map(|ha| format!("{:>3.0}", ha)).collect();
+                        log.line(format!("    layer {l:>2} hectares, row {gz:>2}: {}", cells.join("")));
+                    }
+                }
+            }
+        }
         commands.insert_resource(scatter::Scatter::new(kinds, layer_colour));
     } else {
         log.line("scatter: off");
     }
     let (mut entities, mut terrain_coloured) = (0usize, 0usize);
+    // Test switch: BF1_DECALS=off leaves the decal parts out (to compare).
+    let decals_on = std::env::var("BF1_DECALS").map_or(true, |v| v != "off");
     for (mesh_index, matrix) in &level.placements {
         let m = Mat4::from_cols_array(matrix);
         commands.spawn((Transform::from_matrix(m), Visibility::default())).with_children(|c| {
             for part in &parts[*mesh_index] {
+                if let PartGpu::Shared(_, PartMaterial::Decal(_)) = part {
+                    if !decals_on {
+                        continue;
+                    }
+                }
                 if let PartGpu::Shared(mesh, material) = part {
                     match material {
                         PartMaterial::Standard(h) => c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(h.clone()))),
                         PartMaterial::Paint(h) => c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(h.clone()))),
                         PartMaterial::Detail(h) => c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(h.clone()))),
+                        PartMaterial::Decal(h) => c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(h.clone()), bevy::light::NotShadowCaster)),
                     };
                     entities += 1;
                 }
@@ -610,6 +730,9 @@ enum PartMaterial {
     Paint(Handle<paint::PaintMaterial>),
     /// Buildings: base texture plus detail texture (`detail.rs`).
     Detail(Handle<detail::DetailMaterial>),
+    /// Decals: blended over the surface under them, casting no shadow
+    /// (DESIGN.md "decal variants", step 7).
+    Decal(Handle<StandardMaterial>),
 }
 
 /// Window size: `BF1_WINDOW=<width>x<height>` (for screenshots at the size of

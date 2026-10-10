@@ -178,6 +178,44 @@ fn run() -> Result<()> {
         "bc3-at" => terrain::cmd_bc3_at(&mut log, args.get(1).context("missing file")?, args.get(2).context("missing offset")?.parse()?, args.get(3).context("missing png path")?)?,
         "terrain-minmax" => terrain::cmd_terrain_minmax(&mut log, &root, args.get(1).context("missing superbundle name")?, args.get(2).context("missing record")?.parse()?)?,
         "image-stats" => cmd_image_stats(&mut log, &args[1..])?,
+        "terrain-shader-textures" => {
+            // terrain-shader-textures <superbundle> <level>: every texture the
+            // terrain colour shaders use, with the number of shaders and slots.
+            use fb_ebx::Value;
+            use fb_res::shaderdb::{fb_hash, terrain_colour_shaders, ShaderDb};
+            let sb = args.get(1).context("missing superbundle name")?;
+            let level = args.get(2).context("missing level name")?;
+            let mut fs = fb_vfs::GameFs::open(&root)?;
+            fs.index_toc_chunks()?;
+            let world = fb_level::World::load(&fs, &[sb.as_str()])?;
+            let db = world.read_res_named(&fs, &format!("{level}/shaderdb"))?;
+            let part = (0..world.partitions.len())
+                .find(|&i| world.partitions[i].primary().is_some_and(|p| p.value.type_name == "TerrainData"))
+                .context("no TerrainData")?;
+            let Some(Value::ResourceRef(rid)) = world.partitions[part].primary().and_then(|p| p.value.get("TerrainLayerCombinationsResource")).cloned() else {
+                anyhow::bail!("no TerrainLayerCombinationsResource")
+            };
+            let shaders = terrain_colour_shaders(&world.read_res(&fs, rid)?);
+            let first = shaders.first().context("no terrain colour shaders")?;
+            let sdb = ShaderDb::parse(&db, fb_hash(&first.0.to_lowercase()))?;
+            let mut uses: std::collections::BTreeMap<String, (usize, std::collections::BTreeSet<u32>)> = std::collections::BTreeMap::new();
+            for (name, _) in &shaders {
+                let mut here = std::collections::BTreeSet::new();
+                for b in sdb.blocks_of(name) {
+                    for (slot, t) in sdb.block_texture_slots(b) {
+                        uses.entry(t.clone()).or_default().1.insert(slot);
+                        here.insert(t);
+                    }
+                }
+                for t in here {
+                    uses.entry(t).or_default().0 += 1;
+                }
+            }
+            log.line(format!("{} terrain colour shaders, {} textures", shaders.len(), uses.len()));
+            for (t, (n, slots)) in &uses {
+                log.line(format!("  {n:4} shaders, slots {slots:?}: {t}"));
+            }
+        }
         "shader-textures" => {
             // shader-textures <superbundle> <level> <shader name>...: texture lists from the level shader database.
             use fb_res::shaderdb::{fb_hash, ShaderDb};
@@ -227,6 +265,11 @@ fn run() -> Result<()> {
         }
         "terrain-chunks-save-all" => terrain::cmd_terrain_chunks_save_all(&mut log, &root, args.get(1).context("missing superbundle name")?)?,
         "terrain-chunk-save" => terrain::cmd_terrain_chunk_save(&mut log, &root, args.get(1).context("missing superbundle name")?, args.get(2).context("missing record")?.parse()?)?,
+        "layer-grid" => {
+            // layer-grid <superbundle> <x> <z> <radius m> <step m>
+            let num = |i: usize| -> Result<f32> { Ok(args.get(i).context("usage: layer-grid <superbundle> <x> <z> <radius> <step>")?.parse()?) };
+            terrain::cmd_layer_grid(&mut log, &root, args.get(1).context("missing superbundle name")?, num(2)?, num(3)?, num(4)?, num(5)?)?
+        }
         "terrain-masks" => terrain::cmd_terrain_masks(&mut log, &root, args.get(1).context("missing superbundle name")?, args.get(2).context("missing record")?.parse()?)?,
         "terrain-mask-sheet" => terrain::cmd_terrain_mask_sheet(&mut log, &root, args.get(1).context("missing superbundle name")?, args.get(2).context("missing record")?.parse()?)?,
         "bc3-scan" => terrain::cmd_bc3_scan(&mut log, args.get(1).context("missing file")?, args.get(2).context("missing from")?.parse()?, args.get(3).context("missing to")?.parse()?)?,
@@ -659,21 +702,40 @@ fn cmd_level(log: &mut Log, root: &std::path::Path, superbundle: &str, level: &s
     }
     let mut other: Vec<_> = st.other_entities.iter().collect();
     other.sort_by(|a, b| b.1.cmp(a.1));
-    log.line(format!("--- entities without a mesh: {} types (top 15)", other.len()));
-    for (n, c) in other.iter().take(15) {
+    log.line(format!("--- entities without a mesh: {} types (all)", other.len()));
+    for (n, c) in &other {
         log.line(format!("  {c:>6}  {n}"));
     }
+    log.line(format!(
+        "--- links from those entities to mesh assets (not placed): {} kinds, {} links",
+        st.unplaced_mesh_refs.len(),
+        st.unplaced_mesh_refs.values().map(|v| v.0).sum::<usize>()
+    ));
+    for (k, (n, names)) in &st.unplaced_mesh_refs {
+        let some: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
+        log.line(format!("  {n:>6}  {k}  ({} assets: {})", names.len(), some.join(", ")));
+    }
+    log.line(format!("references without a target (no blueprint, no bundle name): {:?}", st.references_without_target));
+    log.line(format!("blueprints with nothing to walk (no Objects, no Object): {:?}", st.blueprints_not_walked));
 
-    let mut csv = String::from("mesh,source,layer,x,y,z,scale_x,scale_y,scale_z\n");
+    let mut csv = String::from("mesh,source,layer,x,y,z,scale_x,scale_y,scale_z,variation\n");
     for m in meshes {
         let t = m.transform.translation;
         let s = glam::Vec3::new(m.transform.matrix3.x_axis.length(), m.transform.matrix3.y_axis.length(), m.transform.matrix3.z_axis.length());
-        let _ = writeln!(csv, "{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}", m.mesh, m.source, m.layer, t.x, t.y, t.z, s.x, s.y, s.z);
+        let _ = writeln!(csv, "{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{}", m.mesh, m.source, m.layer, t.x, t.y, t.z, s.x, s.y, s.z, m.variation);
     }
     std::fs::create_dir_all("extracted")?;
     let leaf = level.rsplit('/').next().unwrap_or(level).to_lowercase();
     let path = PathBuf::from("extracted").join(format!("{leaf}_placements.csv"));
     std::fs::write(&path, csv)?;
+    let with_variation: Vec<&fb_level::PlacedMesh> = meshes.iter().filter(|m| m.variation != 0).collect();
+    let distinct: HashSet<(&str, u32)> = with_variation.iter().map(|m| (m.mesh.as_str(), m.variation)).collect();
+    log.line(format!(
+        "placements with an object variation: {} ({} mesh and variation pairs, {} meshes)",
+        with_variation.len(),
+        distinct.len(),
+        distinct.iter().map(|d| d.0).collect::<HashSet<_>>().len()
+    ));
     log.line(format!("wrote {} rows to {}", meshes.len(), path.display()));
     Ok(())
 }

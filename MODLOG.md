@@ -2,6 +2,305 @@
 
 Newest entry at the top. One entry per change.
 
+## 2026-10-10: Decals drawn, with their variants (object variations)
+
+**Request (user):** do the decal variants.
+
+**Found (tested by Claude):**
+- **No decal was ever drawn.** The decal mesh's only section is in subset
+  category 2 ("transparent decal"); `decode_lod` decoded only categories 0
+  and 1. Placed meshes with decal-only sections: 38 meshes, 368
+  placements, 482 sections (the decal quads, bunker concrete walls and
+  pillars, foundations).
+- How a placement picks a variant: group members have
+  `InstanceObjectVariation` (one `NameHash` per instance, 0 = none);
+  reference objects have `ObjectVariation` (a link). Each level part's
+  `MeshVariationDatabase` joins (mesh, hash) to a `MeshMaterialVariation`
+  per mesh material; `RedirectEntries` name only (mesh, hash).
+- 2,436 placements use a variant (313 mesh and variant pairs, 180 meshes):
+  111 of the 117 decals (13 variants), and also earth mounds 438, sandbags,
+  bunker parts, charred trees 204, lamps.
+- **Failed reading (kept as a record):** the decal materials have
+  `TileCountX/Y` 2 and `TileIndexX/Y` (base 0, 0; `dirt_01` y 0.5). I read
+  them as a 2 x 2 atlas (uv / count + index). The atlas check says no: the
+  dirt texture has more alpha on its middle lines than on average (0.426
+  against 0.238), like the single-picture manhole (0.639 against 0.364).
+  With the atlas reading every dirt decal showed a corner of one picture.
+  Now the whole texture is used; the tile values are not used.
+
+**What changed (DESIGN.md "decal variants"):**
+- `fb_res::mesh`: category 2 sections are decoded, marked `decal`.
+- `fb_level`: each placed mesh has its variant hash (`PlacedMesh::variation`;
+  group value, else the nearest reference object's). The probe's
+  placements CSV has a `variation` column.
+- Loader: reads the variation databases (446 entries that change a
+  material, 15 of them from redirect entries by our fallback: one mesh
+  material and one `MeshMaterialVariation` in the variant asset). A
+  placement with a variant gets a variant copy of its mesh with the
+  variant's textures and tint; what the variant does not set comes from the
+  mesh material.
+- `BF1_VARIATIONS=decals` (default; meshes under `artassets/decal...`),
+  `all` (2,068 placements change, 196 variant meshes) or `off`.
+- Decal parts: alpha-blended, depth bias 100 (`BF1_DECAL_BIAS`), no
+  shadow, not solid for walking or light probes. `Opacity` scales alpha;
+  `DecalColorMultiply` multiplies the colour (the `_dark` variants: 0,
+  dark stains). The `_Add`, `_RedTint`, `_LerpBaseColor` kinds are drawn
+  the same way (not known). Left out: decal parts whose texture is not
+  `_CA` (67; their alpha is smoothness), and the puddle variant (19; its
+  shader names no colour texture).
+- `BF1_DECALS=off` hides the decals (to compare). New probe command
+  `layer-grid` also prints the terrain height.
+
+**Results (tested by Claude):**
+- 396 decal parts drawn (36 kinds), all 111 decal variants applied, 0
+  without a database entry.
+- At 0.6 m above a mud decal (`BF1_CAMERA="-38,84.4,-245.9,0,-89"`): the
+  inspect key and the view probe hit `decal_128x128_mesh (variant
+  decal_128x128_dirt_02_mud)`; with decals the mean colour is [105, 101, 97]
+  against [121, 114, 109] without; 64% of pixels change.
+- Collision (484 meshes, 7,935 placements) and light probe solids
+  (20,343,537 triangles) are unchanged. All 39 tests pass.
+- **Failed test views:** most ground decals lie on bunker floors 5 to 8 m
+  under the terrain; 4 of my cameras ended inside earth, stairs or
+  concrete, where nothing changed. Not checked: the picture in the bunkers.
+
+**How to test:** `cargo run --release -p bf1_game`. Go into the bunker
+under (-55, 80, -250): dark stains, cracks and manhole covers lie on the
+floor. Outdoors, the mud decal at (-38, 83.8, -246). Compare with
+`BF1_DECALS=off`; try `BF1_VARIATIONS=all` for the other variants (earth
+mounds, sandbags, charred trees).
+
+## 2026-10-10: Mud detail steps 1 and 2 undone; footprints and tyre tracks
+
+**Request (user):** undo the mud steps; the user thinks the missing detail
+is footprints and tyre tracks.
+
+**Undone:** the cavity and the parallax code in `terrain.wgsl` and
+`ground.rs` (and the switches `BF1_GROUND_CAVITY`, `BF1_GROUND_PARALLAX`).
+The shader is back to its earlier text. The missing-`_NRH` fallback is back
+to blue 255. The entries below stay as a record. Not rebuilt yet: the
+user's game window held `bf1_game.exe` open (access denied).
+
+**Found (tested by Claude):**
+- New probe command `layer-grid <superbundle> <x> <z> <radius> <step>`:
+  the strongest ground layer per grid cell. Around the user's mud spot
+  (30 m, 2 m grid): layer 6 39%, layer 7 26%, layer 0 17%, layer 4 8%;
+  the footprints layer (9, `T_V_FootPrints_01`) is a band 8 to 24 m east
+  of the inspected point, running north to south. The user's view looks
+  south-west, onto layer 0. We draw layer 9.
+- No static tyre tracks: no placed model, decal or terrain texture has
+  "track", "tyre" or "tire" in its name. The level has a
+  `TireTrailManagerEntityData`, and the terrain has `DynamicMaskEnable
+  true`: tracks are made while vehicles drive.
+- No decal model stands within 25 m of the spot. The 117 generic decals
+  (`decal_128x128_mesh`) all use their default dirt picture; the level's
+  variations (cracks, dark dirt, mud, puddle, manhole, wall leaks) are not
+  applied.
+- New probe command `terrain-shader-textures <superbundle> <level>`: the 185
+  terrain colour shaders use 33 textures. Not used by us:
+  `T_Variation_03_RGB` (all 185; BC1 mask), `T_Gen_Side_Flows_01_NRH` (179;
+  a real normal and height map, normals follow the height slope, 0.76 and
+  -0.62), `T_DM_VP_CliffSide_Detail_01_NRH` (107), and 6 distance normal
+  maps. The game loader logs the same list now ("other textures of the
+  terrain shaders").
+
+**Checks after the user closed both programs (tested by Claude):**
+- Rebuilt; the reverted ground shader runs with no errors.
+- Frame rate of the backdrop trees (attacker spawn, yaw 121), 5 runs:
+  trees on 58 to 61, 192 to 216, 59 to 64 fps; trees off 150 to 223, 59 to
+  64 fps. The runs at about 60 fps happen with and without the trees, so
+  that cap comes from outside the program (probably Windows slowing a
+  window that is not in front; not checked). The trees cost no measurable
+  frame rate.
+
+## 2026-10-10: Mud detail, step 2: parallax relief from the height
+
+**What changed (DESIGN.md "detail in the mud", step 2):**
+- `terrain.wgsl`: parallax occlusion mapping. The view ray steps (12
+  steps, then a linear refine) down into the weighted `_NRH` height of the
+  ground layers; the colour, normal, smoothness and cavity are sampled
+  where it meets the height. The mesh surface is the top of the range.
+  Within 15 m at full depth, gone by 40 m.
+- `BF1_GROUND_PARALLAX=<metres>`: the height range, default 0.08 (a guess;
+  0 = off). The real game probably moves the ground mesh itself
+  (tessellation); wgpu has no tessellation, so this only shifts the
+  texture.
+
+**Results (tested by Claude, 2000 x 1125, the user's mud view):**
+- No shader errors.
+- Pixel difference against the same view without parallax (new scratch
+  tool, mean of RGB, 0 to 255), mud in the screen middle: 13.0 at 0.08 m
+  (58% of pixels change by more than 8), 16.3 at 0.2 m (66%). A control
+  area at the bottom left: 1.3 and 1.6.
+- Mean, contrast and detail numbers of the mud stay the same (parallax
+  moves detail, it does not add it), so they cannot judge it.
+- Frame rate: 54 to 59 fps with parallax, 54 to 160 without, all with the
+  real game open: not reliable. Not checked: the picture.
+
+**How to test:** `cargo run --release -p bf1_game`, then go to
+`BF1_CAMERA="-257.6,70.0,14.4,408,-50"`. The mud should look darker in the
+cracks and its lumps should seem raised as you move. Compare with
+`BF1_GROUND_CAVITY=0` and `BF1_GROUND_PARALLAX=0`.
+
+## 2026-10-10: Mud detail, step 1: cavity from the `_NRH` blue channel
+
+**Request (user):** a game screenshot of a mud path shows much more detail
+than ours (`BF1_CAMERA="-257.6,70.0,14.4,408,-50"`).
+
+**Found (tested by Claude):**
+- Inspect at that view: the ground is 100% layer 0, `T_Gen_MudPile_02`. So
+  the blend between layers is not the cause there.
+- The weather data has no wetness value (the weathering entity only takes
+  events while the game runs). The mud's wet look is its own smoothness
+  (`_CS` alpha: mean 0.25, up to 0.97), which we already use.
+- `_NRH` blue (unused before): mean 0.26, from 0 to 1; correlation with the
+  height -0.36, with the smoothness -0.55, with the colour red -0.30 (64 x
+  64 mip). We read it as cavity (1 - ambient occlusion). Not confirmed.
+
+**What changed (DESIGN.md "detail in the mud", step 1):**
+- `terrain.wgsl`: the layer colour is multiplied by (1 - k * blue),
+  blended by layer weight. `BF1_GROUND_CAVITY=<k>`, default 1 (0 = off).
+- `ground.rs`: a layer without a usable `_NRH` now gets blue 0 (was 255,
+  which would now mean full cavity, black).
+
+**Results (tested by Claude, 2000 x 1125, mud in the screen middle):**
+
+| | mean | contrast | detail 1 px / 4 px |
+|---|---|---|---|
+| game screenshot (mud left of the gun) | 57, 53, 52 | 14.2 | 7.7 / 11.9 |
+| cavity 0 | 63, 61, 63 | 15.8 | 8.3 / 14.9 |
+| cavity 0.5 | 58, 57, 60 | 16.1 | 8.4 / 15.4 |
+| cavity 1 (default) | 53, 53, 57 | 17.3 | 8.9 / 16.9 |
+
+Cavity 1 is closest in brightness (luminance about 53 against 54). Our mud
+already had more fine contrast than the game's before this step, so the
+missing detail the user sees is not fine noise; probably larger shapes
+(ruts, relief). The views differ (our pitch -50 and tree shadows), so the
+numbers are only a rough guide. Not checked: the picture.
+
+## 2026-10-10: Backdrop trees on the far hills; ivy check
+
+**Request (user):** game screenshots show trees on the hills in the
+background, and ivy on some trees. Both look missing.
+
+**Found (tested by Claude, numbers only):**
+- New log lines "scatter layer .. cover" and "scatter map" (whole map,
+  8 m grid): scatter layer 16 (`ms_dm_treebackdrop_01`) covers about 26 ha,
+  almost all 1 to 2 km from the level centre, in the same map cells as the
+  backdrop houses (`dm_backdrophouse_01_*`); layer 17
+  (`ms_wf_ashtreebackdrop_01`) about 4 ha, 0.5 to 1 km out.
+- Their stored distances read as 500 m (types 13, 14) and 30 m (15, 16), so
+  none was ever drawn from the playable area. The meaning of the 4 stored
+  values for these kinds stays unknown.
+- The number 5000 next to them is not a distance: the group (40, 5, 5000,
+  0.1, 0.3) is `Stiffness`, `Damping`, `Mass`, `WindWiggle`,
+  `DissolveRangeRatio` from the EBX. `FirstSpawnLevel` is 0 for all 17.
+- The backdrop tree mesh is one quad (4 vertices, 2 triangles), using u 0
+  to 0.34 of its texture.
+- The ring of 8 landscape meshes (`terrainscarbackdrop`) uses a brown rock
+  texture (mean sRGB 0.29, 0.25, 0.19), so it is not the green forest.
+
+**What changed (DESIGN.md "backdrop trees on the far hills"):**
+- Scatter kinds with `backdrop` in the mesh name: draw distance 6,000 m
+  (the whole map; our rule; `BF1_BACKDROP_DISTANCE=<metres>`, 0 = off).
+- Tiles up to 256 m (was 64 m); no tiles fully outside the terrain.
+- One-card scatter meshes turn about the vertical axis to face the camera,
+  again after each 10 m of camera movement. New unit test (cards face
+  cameras on all four sides). 21 game tests pass.
+- Test switch `BF1_CUTOUT=<alpha>`: the cut-out threshold of leaf cards
+  (default 0.5).
+
+**Results (tested by Claude):**
+- At the attacker spawn: 6,030 backdrop trees (278 + 2,690 + 2,683 + 379);
+  1,808 tiles. With `BF1_BACKDROP_DISTANCE=0`: 0 and 788 tiles.
+- Screenshot at the attacker spawn, looking at the backdrop houses (yaw
+  121): the horizon band changes very little (mean [63, 70, 69] -> was
+  [64, 71, 70]; detail 9.8 -> 9.6). Near trees, distance (0.7 to 1.3 km) and
+  fog hide most of them in this view. Not checked: the picture.
+- Frame rate about 215 fps, measured with the real game open (not
+  reliable).
+
+**Ivy (not fixed):**
+- `ivyashtree_01_mesh` is placed on 47 of the 120 `treeashbare_01` trees,
+  at exactly the tree positions. Its material: `SS_Vegetation_Foliage_01_
+  AlphaTest`, `TintColorLeaves` (0.76, 0.61, 0.61), `TintColorBranch`
+  0.29 grey (tints not applied).
+- Texture `t_wf_ivy_01_c` (1024 x 2048): leaf pixels average sRGB
+  (0.43, 0.53, 0.31), green.
+- View probe at 7.9 m: the ivy takes 64% of the trunk area, but its pixels
+  are as dark as the bark (mean [13, 27, 33] vs bark [19, 31, 40]).
+- **Failed test:** with `BF1_CUTOUT=0.2` the ivy pixels got darker
+  ([9, 23, 28]), not greener. So the leaves are not cut away; they are
+  drawn dark. Our guess (not confirmed): the leaves need light through
+  them, as game foliage shaders do.
+
+**How to test:** `cargo run --release -p bf1_game`. Look from the attacker
+spawn toward the far houses: small trees should stand on the far hills.
+`BF1_BACKDROP_DISTANCE=0` turns them off to compare.
+
+## 2026-10-10: Check for missing meshes in the level
+
+**Request (user):** are any meshes of the level missing?
+
+**What changed (log only, nothing new is drawn):**
+- `fb_level` walker: two new counts.
+  - `unplaced_mesh_refs`: links to mesh assets from entities that place
+    nothing (searched in all fields, structs, arrays and linked components).
+  - `references_without_target`: reference objects with no blueprint and no
+    bundle name (before, the walker skipped them without a count), and
+    `blueprints_not_walked`.
+- `bf1_probe level`: logs all entity types without a mesh (341), not only
+  the top 15, and the new counts.
+- README: "What does not work yet" names the spawned objects.
+
+**Measured (tested by Claude, Conquest layout):**
+- 8,530 placements of 523 meshes; all 8,530 mesh links resolve; 0
+  unresolved links; 0 group members without positions; 9 references are
+  marked `Excluded` by the level (correct to skip).
+- Mesh links from entities we do not draw: only 4 soldier models
+  (`SoldierEntityData`, runtime characters). No level mesh is behind them.
+- Reference objects with no target: 11 `VehicleSpawnReferenceObjectData`,
+  11 `BFSoldierSpawnEntityData`, 28 `CharacterSpawnReferenceObjectData`, all
+  in spawner or game-mode prefabs. The vehicle is chosen while the game runs
+  (`Blueprint null` in the data). The Conquest layer places 3 fixed
+  machine-gun posts (`pf_fixedmg_sandbags`, which holds only the spawner)
+  and 2 `spawnerprefab_stationary_bl9` guns this way.
+- Doors (55 `DoorEntityData`): the door models are normal static meshes in
+  the door prefabs and are drawn (for example `doorwoodfarm_01_mesh` x11).
+- `WaterEntityData` (1): physics only, nothing to draw.
+- From the game log: the 3 cloth flags (21 placements) fail (inline mesh
+  data); 28 helper placements are left out on purpose (lighting proxies,
+  occluders, gameplay); 1,443 damage-card parts and 293 effect parts are
+  hidden.
+
+**Not checked:** which vehicle each spawn point makes; whether
+`PredestructionEntityData` (21) shows some buildings as already damaged at
+round start in the real game; whether the 23 `MeshProxyEntityData`
+placements should show at all distances.
+
+## 2026-10-10: Second public release (single commit remade)
+
+**Request (user):** remake the single public commit with everything so far,
+as a starting point. The user force-pushes.
+
+**What changed:**
+- `publish/`: 14 files copied from the main folder. 4 are new
+  (`bf1_game/src/inspect.rs`, `overlay.rs`, `scatter.rs`,
+  `fb_terrain/src/scatter.rs`) and 10 are changed (README, MODLOG, DESIGN,
+  `load.rs`, `main.rs` and others). With the `.gitignore` step 6 and the note
+  file `Battlefield 1 Files/PUT_DATA_AND_PATCH_HERE.md`, the release has 62
+  files.
+- The single commit is remade (`git commit --amend`): same author and
+  message, new UTC time. Local commit `7d636c5`, not pushed by Claude.
+
+**Checks (tested by Claude):**
+- Personal-data scan of the commit: no email, Windows user name, local path,
+  LAN address or keys.
+- The `publish/` copy builds by itself (release) and passes all 38 tests.
+- From `Battlefield 1 Files`, the commit has only the note file.
+
+**Not checked:** the push (the user does it); the README steps on a fresh PC.
+
 ## 2026-10-10: Beginner setup guide; which game files are read; empty game folder
 
 **Request (user):** the public README is not clear enough for someone new.

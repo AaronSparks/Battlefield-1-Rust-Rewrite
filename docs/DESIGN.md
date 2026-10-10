@@ -248,6 +248,107 @@ Steps, each measured again with the same regions:
    Measure the detail numbers at a few sizes and keep the closest one
    (a fit to the screenshot, not a value from the data).
 
+### Plan: decal variants (object variations) (2026-10-10; done except step 6, which the data rejected; see MODLOG)
+
+The 117 generic decals (`decal_128x128_mesh`) all show their default dirt
+picture. The level picks a variant for most of them. How the data links it
+(read from the Verdun EBX):
+- A static model group member has `InstanceObjectVariation`: one value
+  per instance, the variant's `NameHash` (0 = default). For groups whose
+  positions come from Havok, we assume the same instance order.
+- A reference object has `ObjectVariation`: a link to an `ObjectVariation`
+  asset (with `NameHash`); it applies to the meshes in its blueprint.
+- Each level part has a `MeshVariationDatabase`. Its entries join (mesh,
+  `VariationAssetNameHash`) to one `MeshVariationDatabaseMaterial` per mesh
+  material: `Material` (the mesh's own material) and `MaterialVariation`
+  (a `MeshMaterialVariation`, null = unchanged). A `MeshMaterialVariation`
+  has the same `Shader` block as a mesh material (shader, vectors,
+  textures), for example `T_DecalGroundCracks_01_CA`.
+- In Verdun (Conquest): 1,896 group instances in 52 meshes use a variant
+  (decals 107, earth mounds 438, sandbags, bunker parts, lamps), and 343
+  reference objects (charred trees 172, plastered walls 54, ruin houses 36).
+
+Steps:
+1. Walker: each placed mesh gets its variant hash (group value, else the
+   nearest reference object's variant).
+2. Loader: read the variation databases. For a placement whose variant
+   changes at least one material, load the mesh once more for that
+   (mesh, variant) with the variant's textures (and tint), falling back to
+   the mesh material for anything the variant does not set.
+3. `BF1_VARIATIONS=decals` (default: meshes under `artassets/decals`),
+   `all`, or `off`. Log: placements per (mesh, variant), entries not found.
+4. Check: counts in the log; the decal textures used; the user's view.
+
+Found while doing steps 1 to 3 (2026-10-10): no decal was ever drawn. The
+decal mesh's only section is in subset category 2 ("transparent decal"),
+and `fb_res::mesh::decode_lod` decodes only categories 0 and 1. Placed
+meshes with decal-only sections: 38 meshes, 368 placements, 482 sections
+(the decal quads and bunker concrete walls and pillars). So:
+
+5. Decode category 2 sections too, marked as decals.
+6. Atlas: the decal materials have `TileCountX/Y` and `TileIndexX/Y` (base
+   dirt decal: 2 x 2, index 0, 0; `dirt_01`: index y 0.5). We read the
+   index as a UV offset: uv' = uv / count + index. A variant that sets none
+   of these uses the whole texture (count 1, index 0); our reading.
+7. Draw decal parts alpha-blended with a small depth bias, casting no
+   shadow. `Opacity` scales the alpha; `DecalColorMultiply` multiplies the
+   colour (the `_dark` variants set 0: dark stains). The `_Add`,
+   `_RedTint` and `_LerpBaseColor` kinds are drawn the same way (not
+   known). The puddle variant (`SS_PuddleSmall_01`) has no texture: its
+   colour texture from the shader database if found, else left out.
+8. Log: decal parts per kind, alpha coverage of the atlas tile used.
+
+### Plan: detail in the mud (2026-10-10; steps 1 and 2 done, then undone at the user's request, see MODLOG)
+
+The user's game screenshot of a mud path shows ruts, deep dark cracks and
+wet shine; ours is flat. At that spot (`BF1_CAMERA="-257.6,70.0,14.4,408,
+-50"`) the ground is 100% layer 0, `T_Gen_MudPile_02`, so the blend between
+layers is not the cause. What the layer has that we do not use:
+- `_NRH` blue (unused so far): mean 0.26, from 0 to 1. Correlation with the
+  height (alpha) -0.36, with the smoothness (`_CS` alpha) -0.55, with the
+  colour -0.30. We read it as cavity (1 - ambient occlusion): high in low,
+  dry cracks. Not confirmed.
+- `_NRH` alpha = height: not used yet (could give relief).
+
+Steps (each with a test switch, each measured on a 2000 x 1125 screenshot
+of the user's view: contrast and detail in the mud, against the game
+screenshot):
+1. Cavity: the layer colour times (1 - k * blue), blended by layer weight
+   like the colour. `BF1_GROUND_CAVITY=<k>` (0 = off).
+2. Relief: parallax occlusion mapping from the height near the camera
+   (fades out by 40 m). `BF1_GROUND_PARALLAX=<depth in metres>` (0 = off).
+   The real game probably moves the ground mesh (tessellation), which wgpu
+   cannot do; parallax only shifts the texture.
+
+Not in this plan: footprint and tyre decals, the texture repeat size.
+
+### Plan: backdrop trees on the far hills (2026-10-10; steps 1 and 2 done, step 3 waits for the user's view)
+
+The user's game screenshots show trees on the hills around the map; ours
+are bare. Found (log "scatter layer .. cover" and "scatter map"):
+- Scatter layer 16 (`ms_dm_treebackdrop_01`, 3 kinds, 0.021 per m2 in all)
+  covers about 26 ha, almost all 1 to 2 km from the level centre, in the
+  same map cells as the backdrop houses (`dm_backdrophouse_01_*`). Layer 17
+  (`ms_wf_ashtreebackdrop_01`) covers about 4 ha, 0.5 to 1 km out.
+- We read their draw distances as 500 m and 30 m, so they never show from
+  the playable area. A backdrop tree with a 500 m range cannot be what the
+  game does there; the meaning of the 4 stored values for these kinds is
+  not known. (The value 5000 near them is the wind `Mass`, from the EBX.)
+- The backdrop tree mesh is one quad (2 triangles), so it must face the
+  camera, or it shows edge-on.
+
+Steps:
+1. Scatter kinds whose mesh name contains `backdrop` use a draw distance
+   that covers the whole map (our rule, `BF1_BACKDROP_DISTANCE` overrides),
+   with tiles up to 256 m (fewer tiles at long range).
+2. Single-quad scatter meshes turn about the vertical axis to face the
+   camera (updated when the camera moves 10 m).
+3. Check: instance counts per kind in the log, frame rate (not with the
+   real game open), and the user's view of the far hills.
+
+Not in this step: the quad uses about a third of its texture (u 0 to
+0.34); the other tree pictures may be chosen per instance by the shader.
+
 ### Plan: scattered grass and debris (2026-10-10; done, see MODLOG)
 
 Found in the data:

@@ -13,8 +13,12 @@
 //! texture take the ground colour at the tile (the mean colour of the ground
 //! textures there, by layer weight) times their tint.
 //!
+//! Kinds whose mesh is one flat card (backdrop trees) turn about the
+//! vertical axis to face the camera (DESIGN.md "backdrop trees on the far
+//! hills").
+//!
 //! Test switches: `BF1_SCATTER=off`, `BF1_SCATTER_DENSITY=<factor>`,
-//! `BF1_SCATTER_DISTANCE=<factor>`.
+//! `BF1_SCATTER_DISTANCE=<factor>`, `BF1_BACKDROP_DISTANCE=<metres>`.
 
 use crate::camera::FlyCam;
 use crate::log::GameLog;
@@ -24,10 +28,12 @@ use fb_terrain::layers::MAX_LAYERS;
 use std::collections::HashMap;
 
 /// Tile side (metres): 8 m, larger for types with a long draw distance
-/// (about 12 tiles across the range, at most 64 m).
+/// (about 12 tiles across the range, at most 256 m).
 fn tile_size(distance: f32) -> f32 {
-    (distance / 12.0).clamp(8.0, 64.0)
+    (distance / 12.0).clamp(8.0, 256.0)
 }
+/// Cards turn to the camera again after it moves this far (metres).
+const CARD_TURN_STEP: f32 = 10.0;
 /// Most new tiles per frame (spreads the work when the camera moves).
 const TILES_PER_FRAME: usize = 48;
 
@@ -42,6 +48,18 @@ pub struct ScatterKind {
     pub parts: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
     /// Ground-coloured blades: tint (linear).
     pub ground_tint: Option<[f32; 3]>,
+    /// One flat card: the turn of its face about the vertical axis in mesh
+    /// space (radians). Such instances face the camera.
+    pub card_facing: Option<f32>,
+}
+
+/// A scatter card that faces the camera; the value is `card_facing`.
+#[derive(Component)]
+pub struct FacingCard(f32);
+
+/// Turn about the vertical axis that points a card's face at the camera.
+fn card_yaw(cam: Vec3, at: Vec3, facing: f32) -> f32 {
+    (cam.x - at.x).atan2(cam.z - at.z) - facing
 }
 
 #[derive(Resource)]
@@ -190,6 +208,14 @@ pub fn update_scatter(
                 }
             }
         }
+        // No tiles that lie fully outside the terrain.
+        if let Some(m) = ground.0.layers.as_ref() {
+            let (lo, hi) = (Vec2::from(m.min), Vec2::from(m.min) + m.width);
+            wanted.retain(|&(_, tx, tz)| {
+                let (a, b) = (Vec2::new(tx as f32, tz as f32) * tile, Vec2::new(tx as f32 + 1.0, tz as f32 + 1.0) * tile);
+                b.x > lo.x && b.y > lo.y && a.x < hi.x && a.y < hi.y
+            });
+        }
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, tx, tz) in wanted {
             if budget == 0 {
@@ -231,7 +257,14 @@ pub fn update_scatter(
             commands.entity(parent).with_children(|c| {
                 for t in &points {
                     for (mesh, material) in &kind.parts {
-                        c.spawn((Mesh3d(mesh.clone()), MeshMaterial3d(tint_material.clone().unwrap_or_else(|| material.clone())), *t));
+                        let material = MeshMaterial3d(tint_material.clone().unwrap_or_else(|| material.clone()));
+                        match kind.card_facing {
+                            Some(f) => {
+                                let t = Transform { rotation: Quat::from_rotation_y(card_yaw(p, t.translation, f)), ..*t };
+                                c.spawn((Mesh3d(mesh.clone()), material, t, FacingCard(f)))
+                            }
+                            None => c.spawn((Mesh3d(mesh.clone()), material, *t)),
+                        };
                     }
                 }
             });
@@ -239,6 +272,20 @@ pub fn update_scatter(
         }
     }
     log_counts(scatter, &time, &log, &mut next_log);
+}
+
+/// Turn the cards to the camera when it has moved `CARD_TURN_STEP` (new
+/// cards are turned when they appear).
+pub fn face_cards(cams: Query<&GlobalTransform, With<FlyCam>>, mut cards: Query<(&mut Transform, &FacingCard)>, mut last: Local<Option<Vec3>>) {
+    let Ok(cam) = cams.single() else { return };
+    let p = cam.translation();
+    if last.is_some_and(|q| q.distance(p) < CARD_TURN_STEP) {
+        return;
+    }
+    *last = Some(p);
+    for (mut t, card) in &mut cards {
+        t.rotation = Quat::from_rotation_y(card_yaw(p, t.translation, card.0));
+    }
 }
 
 /// Every 5 s: tiles and instances per kind.
@@ -269,5 +316,18 @@ mod tests {
         assert!(va.iter().all(|v| (0.0..1.0).contains(v)));
         let mean = va.iter().sum::<f32>() / 100.0;
         assert!((0.35..0.65).contains(&mean), "{mean}");
+    }
+
+    #[test]
+    fn cards_face_the_camera() {
+        // A card whose face points along mesh +X, turned toward cameras on
+        // all four sides: its face must point at the camera.
+        let facing = std::f32::consts::FRAC_PI_2;
+        let at = Vec3::new(10.0, 0.0, -5.0);
+        for cam in [Vec3::new(10.0, 2.0, 50.0), Vec3::new(-40.0, 2.0, -5.0), Vec3::new(10.0, 2.0, -90.0), Vec3::new(60.0, 2.0, -5.0)] {
+            let face = Quat::from_rotation_y(card_yaw(cam, at, facing)) * Vec3::X;
+            let to_cam = Vec3::new(cam.x - at.x, 0.0, cam.z - at.z).normalize();
+            assert!(face.dot(to_cam) > 0.999, "{cam}: {face}");
+        }
     }
 }

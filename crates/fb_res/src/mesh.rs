@@ -279,6 +279,8 @@ pub fn format_size(format: u8) -> Option<usize> {
 pub struct SubMesh {
     pub material_id: i32,
     pub transparent: bool,
+    /// From the "transparent decal" category (drawn over other surfaces).
+    pub decal: bool,
     /// Range in `Geometry::indices`.
     pub first_index: usize,
     pub index_count: usize,
@@ -304,8 +306,8 @@ pub struct DecodeStats {
     pub sections_skipped: usize,
 }
 
-/// Decode the opaque and transparent sections of a LOD from its buffer
-/// (vertex buffer followed by index buffer).
+/// Decode the opaque, transparent and transparent decal sections of a LOD
+/// from its buffer (vertex buffer followed by index buffer).
 pub fn decode_lod(lod: &Lod, buffer: &[u8], stats: &mut DecodeStats) -> Result<Geometry> {
     let vb_size = lod.vertex_buffer_size as usize;
     let ib_size = lod.index_buffer_size as usize;
@@ -314,16 +316,16 @@ pub fn decode_lod(lod: &Lod, buffer: &[u8], stats: &mut DecodeStats) -> Result<G
     let ib = &buffer[vb_size..vb_size + ib_size];
 
     let mut g = Geometry::default();
-    let mut drawn: Vec<(usize, bool)> = Vec::new();
-    for (cat, transparent) in [(category::OPAQUE, false), (category::TRANSPARENT, true)] {
+    let mut drawn: Vec<(usize, bool, bool)> = Vec::new();
+    for (cat, transparent, decal) in [(category::OPAQUE, false, false), (category::TRANSPARENT, true, false), (category::TRANSPARENT_DECAL, true, true)] {
         for &s in &lod.categories[cat] {
-            if !drawn.iter().any(|(d, _)| *d == s as usize) {
-                drawn.push((s as usize, transparent));
+            if !drawn.iter().any(|(d, _, _)| *d == s as usize) {
+                drawn.push((s as usize, transparent, decal));
             }
         }
     }
 
-    for (si, transparent) in drawn {
+    for (si, transparent, decal) in drawn {
         let s = lod.sections.get(si).context("category refers to a missing section")?;
         if s.primitive_type != 3 {
             stats.sections_skipped += 1;
@@ -398,7 +400,7 @@ pub fn decode_lod(lod: &Lod, buffer: &[u8], stats: &mut DecodeStats) -> Result<G
             }
             g.indices.push(base + idx);
         }
-        g.submeshes.push(SubMesh { material_id: s.material_id, transparent, first_index: first, index_count: count });
+        g.submeshes.push(SubMesh { material_id: s.material_id, transparent, decal, first_index: first, index_count: count });
     }
     // Attribute arrays must match positions, or be empty.
     if !g.normals.is_empty() && g.normals.len() != g.positions.len() {

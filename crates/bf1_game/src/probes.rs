@@ -52,7 +52,7 @@ pub fn solid_triangles(level: &Loaded, min: [f32; 2], max: [f32; 2]) -> Vec<[Vec
             continue;
         }
         for p in &mesh.parts {
-            if p.texture.is_some_and(|t| level.textures[t].cutout) {
+            if p.texture.is_some_and(|t| level.textures[t].cutout) || p.decal.is_some() {
                 continue;
             }
             for t in p.indices.chunks_exact(3) {

@@ -25,7 +25,7 @@ use fb_vfs::payload::BlockStats;
 use fb_vfs::superbundle::{read_entry, EntryKind, Superbundle};
 use fb_vfs::GameFs;
 use glam::{Affine3A, Vec3A};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// All EBX partitions of one or more superbundles, indexed by GUID and name.
 pub struct World {
@@ -151,6 +151,10 @@ pub struct PlacedMesh {
     pub source: String,
     /// Name of the sub-world or layer partition it came from.
     pub layer: String,
+    /// Object variation (`NameHash` of an `ObjectVariation`, 0 = none): from
+    /// the group's `InstanceObjectVariation`, else from the nearest reference
+    /// object's `ObjectVariation` (DESIGN.md "decal variants").
+    pub variation: u32,
 }
 
 #[derive(Debug, Default)]
@@ -160,6 +164,17 @@ pub struct WalkStats {
     pub unresolved_links: BTreeMap<String, usize>,
     /// Entities that place nothing visible (logic, sound, spawns...), by type.
     pub other_entities: BTreeMap<String, usize>,
+    /// Links from those entities to mesh assets (in any field, struct, array
+    /// or linked component), by "EntityType field -> AssetType":
+    /// (number of links, asset names). These meshes are not placed.
+    pub unplaced_mesh_refs: BTreeMap<String, (usize, BTreeSet<String>)>,
+    /// Reference objects with no blueprint link and no bundle name, by
+    /// "type in partition" (for example vehicle spawns: the vehicle is chosen
+    /// while the game runs).
+    pub references_without_target: BTreeMap<String, usize>,
+    /// Blueprints reached by a reference that have neither `Objects` nor
+    /// `Object`, by type (nothing in them is walked).
+    pub blueprints_not_walked: BTreeMap<String, usize>,
     pub cycles_skipped: usize,
     pub depth_limit_hits: usize,
     pub subworlds: Vec<String>,
@@ -186,6 +201,8 @@ pub struct Walker<'w> {
     layer: Vec<usize>,
     /// Sub-worlds to leave out, by lower-case name part (for example "rush0").
     pub skip_subworlds: Vec<String>,
+    /// Object variations of the reference objects being walked (innermost last).
+    variations: Vec<u32>,
 }
 
 impl<'w> Walker<'w> {
@@ -198,7 +215,13 @@ impl<'w> Walker<'w> {
             stack: HashSet::new(),
             layer: vec![],
             skip_subworlds: vec![],
+            variations: vec![],
         }
+    }
+
+    /// Variation of the innermost reference object that has one (0 = none).
+    fn current_variation(&self) -> u32 {
+        self.variations.iter().rev().copied().find(|&v| v != 0).unwrap_or(0)
     }
 
     fn current_layer(&self) -> String {
@@ -325,7 +348,10 @@ impl<'w> Walker<'w> {
                 Some(t) => t,
                 None => {
                     // Sub-worlds name their target by bundle name.
-                    let Some(Value::String(bundle)) = c.get("BundleName") else { return };
+                    let Some(Value::String(bundle)) = c.get("BundleName") else {
+                        *self.stats.references_without_target.entry(format!("{} in {}", c.type_name, world.names[part])).or_default() += 1;
+                        return;
+                    };
                     let lower = bundle.to_lowercase();
                     if self.skip_subworlds.iter().any(|s| lower.ends_with(&format!("/{s}"))) {
                         self.stats.subworlds_skipped.push(bundle.clone());
@@ -343,13 +369,26 @@ impl<'w> Walker<'w> {
                     }
                 }
             };
+            // The reference's object variation applies to the meshes inside.
+            let variation = match c.get("ObjectVariation") {
+                Some(Value::Pointer(p)) if !matches!(p, Pointer::Null) => match world.resolve(part, p).map(|v| world.instance(v).get("NameHash")) {
+                    Some(Some(Value::UInt(h))) => *h as u32,
+                    Some(Some(Value::Int(h))) => *h as u32,
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            self.variations.push(variation);
             let bp = world.instance(target);
             if bp.get("Objects").is_some() {
                 self.walk_container(target.0, target.1, xf, depth);
             } else if let Some(Value::Pointer(obj)) = bp.get("Object") {
                 let obj = obj.clone();
                 self.walk_link(target.0, &obj, xf, depth + 1);
+            } else {
+                *self.stats.blueprints_not_walked.entry(bp.type_name.clone()).or_default() += 1;
             }
+            self.variations.pop();
             return;
         }
 
@@ -372,13 +411,31 @@ impl<'w> Walker<'w> {
                     Some(Value::UInt(n)) => *n as usize,
                     _ => 0,
                 };
+                // Variation per instance (0 = none), in instance order; the
+                // group's reference variation for instances without one.
+                let instance_variations: Vec<u32> = match m.get("InstanceObjectVariation") {
+                    Some(Value::Array { items, .. }) => items
+                        .iter()
+                        .map(|v| match v {
+                            Value::UInt(h) => *h as u32,
+                            Value::Int(h) => *h as u32,
+                            _ => 0,
+                        })
+                        .collect(),
+                    _ => vec![],
+                };
+                let outer = self.current_variation();
+                let mut instance = 0usize;
                 let mut push = |xf: Affine3A, source: &str| {
+                    let variation = instance_variations.get(instance).copied().filter(|&v| v != 0).unwrap_or(outer);
+                    instance += 1;
                     self.meshes.push(PlacedMesh {
                         mesh: mesh_name.clone(),
                         mesh_at,
                         transform: parent * ent * xf,
                         source: source.into(),
                         layer: self.current_layer(),
+                        variation,
                     });
                 };
                 let stored: Vec<Affine3A> = match m.get("InstanceTransforms") {
@@ -416,6 +473,7 @@ impl<'w> Walker<'w> {
                     transform: parent * local,
                     source: c.type_name.clone(),
                     layer: self.current_layer(),
+                    variation: self.current_variation(),
                 });
                 return;
             }
@@ -429,6 +487,51 @@ impl<'w> Walker<'w> {
         }
 
         *self.stats.other_entities.entry(c.type_name.clone()).or_default() += 1;
+        let mut found = Vec::new();
+        mesh_refs(world, part, &c.fields, "", 0, &mut found);
+        for (field, asset_type, asset) in found {
+            let e = self.stats.unplaced_mesh_refs.entry(format!("{} {field} -> {asset_type}", c.type_name)).or_default();
+            e.0 += 1;
+            e.1.insert(asset);
+        }
+    }
+}
+
+/// Collect links to mesh assets in `fields`, also inside structs, arrays and
+/// linked `...ComponentData` instances: (field path, asset type, asset name).
+fn mesh_refs(world: &World, part: usize, fields: &[(String, Value)], prefix: &str, depth: usize, out: &mut Vec<(String, String, String)>) {
+    if depth > 3 {
+        return;
+    }
+    for (name, v) in fields {
+        // "$" holds the base class fields: same level, same path.
+        let (path, next) = match name.as_str() {
+            "$" => (prefix.to_string(), depth),
+            _ if prefix.is_empty() => (name.clone(), depth + 1),
+            _ => (format!("{prefix}.{name}"), depth + 1),
+        };
+        mesh_refs_value(world, part, v, &path, next, out);
+    }
+}
+
+fn mesh_refs_value(world: &World, part: usize, v: &Value, path: &str, depth: usize, out: &mut Vec<(String, String, String)>) {
+    match v {
+        Value::Pointer(p) if !matches!(p, Pointer::Null) => {
+            let Some(at) = world.resolve(part, p) else { return };
+            let target = world.instance(at);
+            if target.type_name.contains("MeshAsset") {
+                out.push((path.to_string(), target.type_name.clone(), world.link_name(part, p)));
+            } else if target.type_name.ends_with("ComponentData") {
+                mesh_refs(world, at.0, &target.fields, path, depth, out);
+            }
+        }
+        Value::Array { items, .. } => {
+            for it in items {
+                mesh_refs_value(world, part, it, &format!("{path}[]"), depth, out);
+            }
+        }
+        Value::Struct(s) => mesh_refs(world, part, &s.fields, path, depth, out),
+        _ => {}
     }
 }
 

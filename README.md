@@ -182,13 +182,23 @@ Tested on build 5142699 (Steam), 2026-10-03:
   ground textures with their normal maps and smoothness where the game's own
   layer masks put them, but the blend rule is our assumption, the texture
   repeat size is a guess, and each layer's other textures (variation,
-  distance) are not used. Far away
+  distance) are not used. The terrain shaders also use textures we do not:
+  a variation mask, a "side flows" normal map (probably for slopes), a
+  cliff detail map and 6 distance normal maps. Tyre tracks: the level has
+  no static ones; the game makes them while vehicles drive (not done). Far away
   (over about 450 m) the ground uses its colour map, which is a plain
   grey-brown in about half of the battle area. 10 small
   mesh parts are still grey (a helmet, a stove, a plane wreck). Wires use a
   guessed dark colour.
 - Damage cards on wooden props are hidden (we think they show only after a
   hit; not confirmed).
+- Decals (dirt, mud, stains, cracks, manhole covers, wall leaks) are drawn
+  with their level variants, blended over the surface. Their blend kinds
+  (`_Add`, `_RedTint`, `_LerpBaseColor`) are all drawn the same way; the
+  19 puddles and 67 decal parts without an alpha texture are left out.
+  Variants of other objects (earth mounds, sandbags, charred trees, 2,068
+  placements) are off by default: `BF1_VARIATIONS=all` turns them on (not
+  checked by eye).
 - Effects (fire, smoke, dust, falling embers) and the vignette are not drawn
   yet. The sun strength is calibrated against the user's screenshots
   (sun / pi), not taken directly from the data. Interiors are darkened by our
@@ -203,7 +213,14 @@ Tested on build 5142699 (Steam), 2026-10-03:
   scattering data, but without wind, without fading at the edge of their
   draw distance, and with our own choice of colour for the grass blades
   (the ground colour under them). Which of the 4 stored distances the game
-  uses is our reading.
+  uses is our reading. Backdrop trees (flat cards on the far hills, about
+  6,000) are drawn over the whole map and turn to face the camera: both are
+  our rules, because their stored distances (500 and 30 m) cannot reach
+  hills 0.7 to 2 km away. Only one of the card's tree pictures is used.
+- Ivy on the ash trees (47 trees) is placed but drawn about as dark as the
+  bark. A lower cut-out threshold did not help, so the leaves are not cut
+  away; we think the leaves need light through them (not done), but this is
+  not confirmed.
 - Material tints: only gun paint (with its paint mask) and cloth covers are
   applied (fitted to the user's screenshots). Bare metal is not drawn as
   metal yet. About 30 other tint kinds (trees, houses, walls) are
@@ -214,7 +231,13 @@ Tested on build 5142699 (Steam), 2026-10-03:
   ground is a simple fitted term, not computed.
 - The frame rate drops very low when leaf cards (hedges) are right in front
   of the camera.
-- 3 cloth flag meshes with inline data, and 13 textures from other superbundles.
+- 3 cloth flag meshes with inline data (the capture point flags, 21
+  placements), and 13 textures from other superbundles.
+- Objects that the game creates only while a round runs are not drawn: the
+  weapons of the 11 vehicle spawn points in the Conquest layout (for example
+  3 fixed machine-gun posts and 2 fixed guns), soldiers, and some weapon
+  pickups. Their model is chosen at run time, so the level data does not
+  name it. Effects, lamp light and lens flares are not drawn either.
 - Chunks stored as a range (`rangeStart`/`rangeEnd`, 2,896 entries): they
   decompress, but their size is not checked yet. Not tested beyond "no error".
 

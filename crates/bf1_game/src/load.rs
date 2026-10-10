@@ -22,6 +22,10 @@ pub struct Options {
     /// The same for the tiling ground textures. Full size (0) gave no
     /// measurable gain (MODLOG 2026-10-07), so 1; `BF1_GROUND_MIP_SKIP=<n>`.
     pub ground_mip_skip: usize,
+    /// Which placements get their object variation (DESIGN.md "decal
+    /// variants"): "decals" (meshes under `artassets/decals`), "all" or
+    /// "off"; `BF1_VARIATIONS=<mode>`.
+    pub variations: String,
 }
 
 impl Default for Options {
@@ -35,6 +39,7 @@ impl Default for Options {
                 .collect(),
             texture_mip_skip: 1,
             ground_mip_skip: std::env::var("BF1_GROUND_MIP_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+            variations: std::env::var("BF1_VARIATIONS").unwrap_or_else(|_| "decals".into()).to_lowercase(),
         }
     }
 }
@@ -62,6 +67,51 @@ pub struct Part {
     pub uvs1: Vec<[f32; 2]>,
     /// Index into the mesh asset's `Materials`.
     pub material_id: i32,
+    /// Set for parts from the "transparent decal" category: drawn blended
+    /// over other surfaces (DESIGN.md "decal variants", step 7).
+    pub decal: Option<DecalLook>,
+}
+
+/// How a decal part is drawn (DESIGN.md "decal variants", step 7).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecalLook {
+    /// Alpha multiplier (`Opacity`).
+    pub opacity: f32,
+    /// Colour multiplier (`DecalColorMultiply`); white if not set.
+    pub multiply: [f32; 3],
+}
+
+/// Decal shader values of a material (or a material variation): opacity
+/// and colour multiplier (defaults 1 and white). The atlas values
+/// (`TileCountX/Y`, `TileIndexX/Y`) are not used: the decal textures hold one
+/// centred picture, not 2 x 2 tiles (MODLOG "decal variants").
+fn decal_params(world: &World, mat: (usize, usize)) -> DecalLook {
+    let mut p = DecalLook { opacity: 1.0, multiply: [1.0; 3] };
+    let Some(Value::Struct(sh)) = world.get(mat).get("Shader") else { return p };
+    let Some(Value::Array { items, .. }) = sh.get("VectorParameters") else { return p };
+    for v in items {
+        let Value::Struct(v) = v else { continue };
+        let (Some(Value::String(name)), Some(Value::Struct(x))) = (v.get("ParameterName"), v.get("Value")) else { continue };
+        let f = |n: &str| match x.get(n) {
+            Some(Value::Float(f)) => *f as f32,
+            _ => 0.0,
+        };
+        match name.as_str() {
+            "Opacity" => p.opacity = f("x"),
+            "DecalColorMultiply" => p.multiply = [f("x"), f("y"), f("z")],
+            _ => {}
+        }
+    }
+    p
+}
+
+/// The shader a material (or material variation) names, if any.
+fn shader_name(world: &World, mat: (usize, usize)) -> Option<String> {
+    let Some(Value::Struct(sh)) = world.get(mat).get("Shader") else { return None };
+    match sh.get("Shader") {
+        Some(Value::Pointer(p)) if !matches!(p, Pointer::Null) => Some(world.link_name(mat.0, p)),
+        _ => None,
+    }
 }
 
 /// A detail texture over the base texture (DESIGN.md "flat grey walls"):
@@ -106,6 +156,8 @@ pub struct LoadedMesh {
     pub parts: Vec<Part>,
     /// Why parts were left out (one entry per part, for the log).
     pub hidden: Vec<String>,
+    /// Sections only in the "transparent decal" category (for the log).
+    pub decal_sections: usize,
 }
 
 /// How a material is drawn.
@@ -218,7 +270,8 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
 
     // Meshes and textures.
     let t = Instant::now();
-    let mut mesh_index: HashMap<(usize, usize), Option<usize>> = HashMap::new();
+    // Loaded meshes by (mesh asset, object variation; 0 = none).
+    let mut mesh_index: HashMap<((usize, usize), u32), Option<usize>> = HashMap::new();
     let mut texture_index: HashMap<u64, Option<usize>> = HashMap::new();
     let mut environments = Vec::new();
     match crate::environment::read(&fs, &world, crate::environment::DEFAULT_ENVIRONMENT, log) {
@@ -241,6 +294,12 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
     let mut helper_meshes = 0usize;
     let mut guessed = 0usize;
     let mut uv_stats = UvStats::default();
+    // Object variations (DESIGN.md "decal variants").
+    let variation_db = read_variation_db(&world);
+    let variation_names = read_variation_names(&world);
+    // Placements per variant mesh: (count, index into loaded.meshes).
+    let mut variant_counts: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
+    let (mut variants_wanted, mut variants_unchanged, mut variants_switched_off) = (0usize, 0usize, 0usize);
 
     for placed in &walker.meshes {
         let Some(at) = placed.mesh_at else { continue };
@@ -250,11 +309,32 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
             helper_meshes += 1;
             continue;
         }
-        let index = match mesh_index.get(&at) {
+        // The variant, if it changes a material of this mesh and the switch allows it.
+        let variant = match placed.variation {
+            0 => 0,
+            _ if !variation_applies(&opts.variations, &placed.mesh) => {
+                variants_switched_off += 1;
+                0
+            }
+            v => {
+                variants_wanted += 1;
+                if variation_db.contains_key(&(at, v)) {
+                    v
+                } else {
+                    variants_unchanged += 1;
+                    0
+                }
+            }
+        };
+        let index = match mesh_index.get(&(at, variant)) {
             Some(i) => *i,
             None => {
-                let i = match load_mesh(&fs, &world, at, opts, &mut loaded.textures, &mut texture_index, &mut stats, &folders, &mut guessed, &mut uv_stats) {
-                    Ok(m) => {
+                let overrides = variation_db.get(&(at, variant));
+                let i = match load_mesh(&fs, &world, at, opts, overrides, &mut loaded.textures, &mut texture_index, &mut stats, &folders, &mut guessed, &mut uv_stats) {
+                    Ok(mut m) => {
+                        if variant != 0 {
+                            m.name = format!("{} (variant {})", m.name, variation_names.get(&variant).cloned().unwrap_or_else(|| variant.to_string()));
+                        }
                         parts_without_texture += m.parts.iter().filter(|p| p.texture.is_none()).count();
                         parts_computed_normals += m.parts.iter().filter(|p| p.normals.is_empty()).count();
                         loaded.meshes.push(m);
@@ -268,14 +348,34 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
                         None
                     }
                 };
-                mesh_index.insert(at, i);
+                mesh_index.insert((at, variant), i);
                 i
             }
         };
         if let Some(i) = index {
             let m = convert::transform(placed.transform.to_cols_array());
             loaded.placements.push((i, m.to_cols_array()));
+            if variant != 0 {
+                let e = variant_counts.entry(loaded.meshes[i].name.rsplit('/').next().unwrap_or("").to_string()).or_insert((0, i));
+                e.0 += 1;
+            }
         }
+    }
+    log.line(format!(
+        "object variations (BF1_VARIATIONS={}): {} database entries that change a material; placements with a variant {} (left out by the switch {}), drawn with it {}, no entry or no change {}; {} variant meshes",
+        opts.variations,
+        variation_db.len(),
+        variants_wanted + variants_switched_off,
+        variants_switched_off,
+        variant_counts.values().map(|v| v.0).sum::<usize>(),
+        variants_unchanged,
+        variant_counts.len()
+    ));
+    let mut top: Vec<_> = variant_counts.iter().collect();
+    top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    for (name, (n, i)) in top.iter().take(20) {
+        let textures: Vec<&str> = loaded.meshes[*i].parts.iter().filter_map(|p| p.texture).map(|t| loaded.textures[t].name.rsplit('/').next().unwrap_or("")).collect();
+        log.line(format!("  {n:>4} x {name}: {}", textures.join(", ")));
     }
     // Why parts are grey, counted per placement (what you see), most common first.
     let mut grey: HashMap<String, (usize, std::collections::BTreeMap<String, usize>)> = HashMap::new();
@@ -321,6 +421,57 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
         coloured += loaded.meshes[*i].parts.iter().filter(|p| p.colour.is_some()).count();
     }
     log.line(format!("placed parts left out: {hidden:?}; drawn with a plain colour: {coloured}"));
+    // Decal parts (DESIGN.md "decal variants", step 8): placements per mesh,
+    // texture, tile, opacity, colour multiplier; and per decal texture the
+    // mean alpha on the middle lines (u or v = 0.5) against the whole: near 0
+    // on the lines means a 2 x 2 atlas.
+    let mut decal_parts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut decal_textures: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (i, _) in &loaded.placements {
+        for p in loaded.meshes[*i].parts.iter() {
+            let Some(d) = p.decal else { continue };
+            let tex = p.texture.map(|t| loaded.textures[t].name.rsplit('/').next().unwrap_or("").to_string()).unwrap_or_else(|| "no texture".into());
+            let (u0, u1) = p.uvs.iter().fold((f32::MAX, f32::MIN), |(a, b), uv| (a.min(uv[0]), b.max(uv[0])));
+            let (v0, v1) = p.uvs.iter().fold((f32::MAX, f32::MIN), |(a, b), uv| (a.min(uv[1]), b.max(uv[1])));
+            let key = format!("{}: {tex}, uv {u0:.2}..{u1:.2} x {v0:.2}..{v1:.2}, opacity {:.2}, multiply {:?}", loaded.meshes[*i].name.rsplit('/').next().unwrap_or(""), d.opacity, d.multiply);
+            *decal_parts.entry(key).or_default() += 1;
+            if let Some(t) = p.texture {
+                decal_textures.insert(t);
+            }
+        }
+    }
+    log.line(format!("decal parts placed: {} ({} kinds)", decal_parts.values().sum::<usize>(), decal_parts.len()));
+    let mut top: Vec<_> = decal_parts.iter().collect();
+    top.sort_by(|a, b| b.1.cmp(a.1));
+    for (k, n) in top.iter().take(30) {
+        log.line(format!("  {n:>4} x {k}"));
+    }
+    for t in decal_textures {
+        if let Some((w, h, px)) = small_mip_sized(&loaded.textures[t], 128) {
+            let a = |x: usize, y: usize| px[y * w + x][3] as f32 / 255.0;
+            let whole = px.iter().map(|p| p[3] as f32 / 255.0).sum::<f32>() / px.len() as f32;
+            let lines = ((0..h).map(|y| a(w / 2, y)).sum::<f32>() + (0..w).map(|x| a(x, h / 2)).sum::<f32>()) / (w + h) as f32;
+            log.line(format!("  decal texture {}: {w}x{h} mip, mean alpha {whole:.3}, on the middle lines {lines:.3}", loaded.textures[t].name.rsplit('/').next().unwrap_or("")));
+        }
+    }
+    // Decal sections (category "transparent decal"), drawn since step 5.
+    let mut decal_meshes: std::collections::BTreeMap<&str, (usize, usize)> = std::collections::BTreeMap::new();
+    for (i, _) in &loaded.placements {
+        let m = &loaded.meshes[*i];
+        if m.decal_sections > 0 {
+            let e = decal_meshes.entry(m.name.rsplit('/').next().unwrap_or("")).or_insert((0, m.decal_sections));
+            e.0 += 1;
+        }
+    }
+    let mut top: Vec<_> = decal_meshes.iter().collect();
+    top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    log.line(format!(
+        "decal sections: {} meshes, {} placements, {} sections placed; most placed: {}",
+        decal_meshes.len(),
+        decal_meshes.values().map(|v| v.0).sum::<usize>(),
+        decal_meshes.values().map(|v| v.0 * v.1).sum::<usize>(),
+        top.iter().take(15).map(|(n, (c, s))| format!("{n} {c}x{s}")).collect::<Vec<_>>().join(", ")
+    ));
     // Winding check: a triangle faces the viewer when its corners go counter-clockwise,
     // so its geometric normal must point the same way as its stored normals.
     let (mut agree, mut disagree) = (0usize, 0usize);
@@ -428,7 +579,7 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
                 // The same mesh can serve several types: load it once.
                 let mesh = match loaded.meshes.iter().position(|m| m.name.eq_ignore_ascii_case(&world.names[part])) {
                     Some(i) => i,
-                    None => match load_mesh(&fs, &world, (part, 0), opts, &mut loaded.textures, &mut texture_index, &mut stats, &folders, &mut guessed, &mut uv_stats) {
+                    None => match load_mesh(&fs, &world, (part, 0), opts, None, &mut loaded.textures, &mut texture_index, &mut stats, &folders, &mut guessed, &mut uv_stats) {
                         Ok(mut m) => {
                             // Shader-graph materials keep their textures in the
                             // shader: take the colour texture from the shader database.
@@ -721,6 +872,19 @@ fn terrain_layer_map(fs: &GameFs, world: &World, db: &[u8]) -> Result<LayerMaps>
         st.layers_without,
         normals.len()
     );
+    // Every other texture the terrain shaders use (not a layer's _CS or
+    // _NRH), with the number of shaders that use it.
+    let mut other: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (name, _) in &shaders {
+        for t in sdb.textures_of(name).unwrap_or_default() {
+            let l = t.to_ascii_lowercase();
+            if !l.ends_with("_cs") && !l.ends_with("_nrh") {
+                *other.entry(t).or_default() += 1;
+            }
+        }
+    }
+    let other: Vec<String> = other.iter().map(|(t, n)| format!("{t} ({n})")).collect();
+    let summary = format!("{summary}; other textures of the terrain shaders: [{}]", other.join(", "));
     Ok((map, normals, summary))
 }
 
@@ -847,11 +1011,109 @@ fn load_terrain(fs: &GameFs, world: &World) -> Result<fb_terrain::Terrain> {
     Ok(terrain)
 }
 
+/// Material changes of the level's object variations (DESIGN.md "decal
+/// variants"): for each (mesh asset, variant `NameHash`), the
+/// `MeshMaterialVariation` that replaces each changed mesh material. Read from
+/// every loaded `MeshVariationDatabase`; entries that change nothing are left
+/// out.
+type VariationDb = HashMap<((usize, usize), u32), HashMap<(usize, usize), (usize, usize)>>;
+
+fn read_variation_db(world: &World) -> VariationDb {
+    let mut db = VariationDb::new();
+    // ObjectVariation partitions by NameHash (for redirect entries).
+    let mut variation_parts: HashMap<u32, usize> = HashMap::new();
+    for part in 0..world.partitions.len() {
+        if let Some(p) = world.partitions[part].primary().filter(|p| p.value.type_name == "ObjectVariation") {
+            if let Some(Value::UInt(h)) = p.value.get("NameHash") {
+                variation_parts.insert(*h as u32, part);
+            }
+        }
+    }
+    for part in 0..world.partitions.len() {
+        let Some(primary) = world.partitions[part].primary() else { continue };
+        if primary.value.type_name != "MeshVariationDatabase" {
+            continue;
+        }
+        let Some(Value::Array { items, .. }) = primary.value.get("Entries") else { continue };
+        for e in items {
+            let Value::Struct(e) = e else { continue };
+            let hash = match e.get("VariationAssetNameHash") {
+                Some(Value::UInt(h)) => *h as u32,
+                Some(Value::Int(h)) => *h as u32,
+                _ => 0,
+            };
+            let (Some(Value::Pointer(mesh)), Some(Value::Array { items: materials, .. })) = (e.get("Mesh"), e.get("Materials")) else { continue };
+            let Some(mesh) = world.resolve(part, mesh).filter(|_| hash != 0) else { continue };
+            let mut changes = HashMap::new();
+            for m in materials {
+                let Value::Struct(m) = m else { continue };
+                let (Some(Value::Pointer(a)), Some(Value::Pointer(v))) = (m.get("Material"), m.get("MaterialVariation")) else { continue };
+                if let (Some(a), Some(v)) = (world.resolve(part, a), world.resolve(part, v)) {
+                    changes.insert(a, v);
+                }
+            }
+            if !changes.is_empty() {
+                db.entry((mesh, hash)).or_default().extend(changes);
+            }
+        }
+        // Redirect entries name only (mesh, hash); the material change lives
+        // elsewhere. Fallback (our rule): a mesh with one material and a
+        // variant asset with exactly one `MeshMaterialVariation` pair up.
+        let Some(Value::Array { items: redirects, .. }) = primary.value.get("RedirectEntries") else { continue };
+        for e in redirects {
+            let Value::Struct(e) = e else { continue };
+            let hash = match e.get("VariationAssetNameHash") {
+                Some(Value::UInt(h)) => *h as u32,
+                Some(Value::Int(h)) => *h as u32,
+                _ => 0,
+            };
+            let Some(Value::Pointer(mesh)) = e.get("Mesh") else { continue };
+            let Some(mesh) = world.resolve(part, mesh).filter(|m| hash != 0 && !db.contains_key(&(*m, hash))) else { continue };
+            let Some(Value::Array { items: mats, .. }) = world.get(mesh).get("Materials") else { continue };
+            let [Value::Pointer(only)] = mats.as_slice() else { continue };
+            let Some(only) = world.resolve(mesh.0, only) else { continue };
+            let Some(vpart) = variation_parts.get(&hash) else { continue };
+            let vars: Vec<usize> = (0..world.partitions[*vpart].instances.len()).filter(|&i| world.get((*vpart, i)).type_name == "MeshMaterialVariation").collect();
+            if let [v] = vars.as_slice() {
+                db.entry((mesh, hash)).or_default().insert(only, (*vpart, *v));
+            }
+        }
+    }
+    db
+}
+
+/// Short names of the loaded `ObjectVariation` assets, by `NameHash`.
+fn read_variation_names(world: &World) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    for part in 0..world.partitions.len() {
+        let Some(primary) = world.partitions[part].primary().filter(|p| p.value.type_name == "ObjectVariation") else { continue };
+        let hash = match primary.value.get("NameHash") {
+            Some(Value::UInt(h)) => *h as u32,
+            Some(Value::Int(h)) => *h as u32,
+            _ => continue,
+        };
+        out.insert(hash, world.names[part].rsplit('/').next().unwrap_or("").to_string());
+    }
+    out
+}
+
+/// Whether the `BF1_VARIATIONS` mode applies to this mesh.
+fn variation_applies(mode: &str, mesh: &str) -> bool {
+    match mode {
+        "all" => true,
+        "off" => false,
+        // Both `artassets/decals/` and `xpack1/artassets/decal/`.
+        _ => mesh.to_ascii_lowercase().contains("artassets/decal"),
+    }
+}
+
 fn load_mesh(
     fs: &GameFs,
     world: &World,
     at: (usize, usize),
     opts: &Options,
+    // Object variation: mesh material -> the material variation that replaces it.
+    variant: Option<&HashMap<(usize, usize), (usize, usize)>>,
     textures: &mut Vec<TextureData>,
     texture_index: &mut HashMap<u64, Option<usize>>,
     stats: &mut DecodeStats,
@@ -866,6 +1128,19 @@ fn load_mesh(
     let chunk = lod.chunk_id.context("inline mesh data (not supported yet)")?;
     let g = decode_lod(lod, &world.read_chunk(fs, &chunk)?, stats)?;
 
+    // Each material and the variant material that replaces it (if any).
+    let sources: Vec<Option<((usize, usize), Option<(usize, usize)>)>> = match asset.get("Materials") {
+        Some(Value::Array { items, .. }) => items
+            .iter()
+            .map(|m| {
+                let Value::Pointer(p) = m else { return None };
+                let mat = world.resolve(at.0, p)?;
+                Some((mat, variant.and_then(|v| v.get(&mat)).copied()))
+            })
+            .collect(),
+        _ => vec![],
+    };
+
     // Base colour texture of each material.
     let looks: Vec<Look> = match asset.get("Materials") {
         Some(Value::Array { items, .. }) => items
@@ -873,6 +1148,9 @@ fn load_mesh(
             .map(|m| {
                 let Value::Pointer(p) = m else { return Look::Missing("material is not a link".into()) };
                 let Some(mat) = world.resolve(at.0, p) else { return Look::Missing("material not loaded".into()) };
+                // A variant replaces the material's textures and values; what it
+                // does not set comes from the mesh material.
+                let var = variant.and_then(|v| v.get(&mat)).copied();
                 if is_effect_material(world, mat) {
                     return Look::Hide("effect");
                 }
@@ -882,7 +1160,20 @@ fn load_mesh(
                 if is_terrain_coloured(world, mat) {
                     return Look::Terrain;
                 }
-                let tex = match base_color_texture(world, mat) {
+                // A variant with its own shader and no colour texture (the
+                // puddle): the shader database may name one; else the part is
+                // left out rather than drawn with the mesh's texture.
+                let var_texture = match var {
+                    Some(v) if base_color_texture(world, v).is_none() && shader_name(world, v).is_some_and(|sv| Some(&sv) != shader_name(world, mat).as_ref()) => {
+                        match shader_name(world, v).and_then(|sv| shader_colour_texture(fs, world, opts, &sv)) {
+                            Some(t) => Some(t),
+                            None => return Look::Hide("variant without a texture"),
+                        }
+                    }
+                    Some(v) => base_color_texture(world, v),
+                    None => None,
+                };
+                let tex = match var_texture.or_else(|| base_color_texture(world, mat)) {
                     Some(t) => t,
                     None => {
                         if let Some(c) = plain_colour(world, mat) {
@@ -895,10 +1186,11 @@ fn load_mesh(
                 };
                 match load_texture(fs, world, tex, opts.texture_mip_skip, textures, texture_index) {
                     Some(i) => {
-                        let mut tint = material_tint(world, mat);
+                        let tint_from = var.filter(|&v| material_tint(world, v).is_some()).unwrap_or(mat);
+                        let mut tint = material_tint(world, tint_from);
                         if let Some(t) = tint.as_mut().filter(|t| t.kind == "paint") {
                             // The mask is small (512 pixels); load it at full size.
-                            t.mask = texture_parameter(world, mat, "Masks").and_then(|m| load_texture(fs, world, m, 0, textures, texture_index));
+                            t.mask = texture_parameter(world, tint_from, "Masks").and_then(|m| load_texture(fs, world, m, 0, textures, texture_index));
                         }
                         let detail = material_detail(world, mat).and_then(|(t, m, swap_sets)| {
                             let texture = load_texture(fs, world, t, opts.texture_mip_skip, textures, texture_index)?;
@@ -926,9 +1218,16 @@ fn load_mesh(
             hidden.push(why.to_string());
             continue;
         }
+        // Decals are drawn by their texture's alpha. A decal whose colour
+        // texture is not `_CA` (colour and alpha; `_CS` alpha is smoothness)
+        // would need another opacity source we do not know: left out.
+        if s.decal && !matches!(looks.get(s.material_id as usize), Some(Look::Texture(i, ..)) if textures[*i].name.to_ascii_lowercase().ends_with("_ca")) {
+            hidden.push("decal without an alpha texture".to_string());
+            continue;
+        }
         // Keep only the vertices this part uses.
         let mut remap: HashMap<u32, u32> = HashMap::new();
-        let mut part = Part { positions: vec![], normals: vec![], uvs: vec![], indices: vec![], texture: None, colour: None, missing: None, terrain_coloured: false, tint: None, detail: None, uvs1: vec![], material_id: s.material_id };
+        let mut part = Part { positions: vec![], normals: vec![], uvs: vec![], indices: vec![], texture: None, colour: None, missing: None, terrain_coloured: false, tint: None, detail: None, uvs1: vec![], material_id: s.material_id, decal: None };
         // Second texture coordinate set of the part (0x22), if the mesh has one.
         let mut second: Vec<[f32; 2]> = Vec::new();
         for tri in g.indices[s.first_index..s.first_index + s.index_count].chunks(3) {
@@ -991,6 +1290,13 @@ fn load_mesh(
                 *uv_stats.flat_by_mesh.entry(format!("{} material {}", world.names[at.0].rsplit('/').next().unwrap_or(""), s.material_id)).or_default() += flat;
             }
         }
+        // Decal parts: how to blend (from the variant material if any).
+        if s.decal {
+            part.decal = Some(match sources.get(s.material_id as usize) {
+                Some(Some((mat, var))) => decal_params(world, var.unwrap_or(*mat)),
+                _ => DecalLook { opacity: 1.0, multiply: [1.0; 3] },
+            });
+        }
         match looks.get(s.material_id as usize) {
             Some(Look::Texture(i, tint, _)) => {
                 part.texture = Some(*i);
@@ -1004,7 +1310,11 @@ fn load_mesh(
         }
         parts.push(part);
     }
-    Ok(LoadedMesh { name: world.names[at.0].clone(), parts, hidden })
+    let decal_sections = lod.categories[fb_res::mesh::category::TRANSPARENT_DECAL]
+        .iter()
+        .filter(|s| !lod.categories[fb_res::mesh::category::OPAQUE].contains(s) && !lod.categories[fb_res::mesh::category::TRANSPARENT].contains(s))
+        .count();
+    Ok(LoadedMesh { name: world.names[at.0].clone(), parts, hidden, decal_sections })
 }
 
 /// The colour texture of a material: from its own texture parameters, else
