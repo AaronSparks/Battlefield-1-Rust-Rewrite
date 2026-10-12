@@ -248,6 +248,224 @@ Steps, each measured again with the same regions:
    Measure the detail numbers at a few sizes and keep the closest one
    (a fit to the screenshot, not a value from the data).
 
+### Plan: damaged parts hidden at the start (2026-10-11; done, confirmed by the user)
+
+The user: with see-through glass the windows look broken; at the start of
+a match they are whole (real-game screenshot). Found on
+`housefarmwindow_01_b_mesh` (a `CompositeMeshAsset`): each vertex carries a
+mesh part number in its blend indices (usage 0x02, first byte). The glass
+has part 1 (16 triangles, the 4 whole panes, 76% of the window area) and
+parts 2 and 4 (316 and 158 triangles, shards). The window's
+`StaticModelEntityData` has 3 `PartComponentData`, each with `HealthStates`
+(`Health`, `PartIndex`): (100: part 0), (100: part 1; 90: part 2; 0: none),
+(90: part 3; 5: part 4; 0: none). So at the start (the state with the most
+health) parts 0, 1 and 3 show; parts 2 and 4 are damage states.
+
+Steps:
+1. `fb_res::mesh`: `Geometry::parts`, the part number of each vertex (first
+   byte of the blend indices; empty if no section has them).
+2. `load.rs`: for every `...ModelEntityData` with a `Mesh` and part
+   components: hidden parts = part numbers of the other health states minus
+   those of the start states; per mesh asset (if two entities disagree, only
+   the parts hidden by both). Triangles with a vertex in a hidden part are
+   left out. Log: entities, meshes with hidden parts, placements, triangles
+   left out. `BF1_DAMAGED_PARTS=show` for the old way.
+3. Check: the window (glass covered once on each side, no star); the light
+   probe bake (geometry changes, so a new bake); the user's view.
+
+### Plan: window glass (2026-10-11; steps 1 and 2 done)
+
+The user: the glass of the windows in the rural area is bright blue. Found:
+the glass materials name no texture (shaders `SS_HouseFarmGlass_01`,
+`SS_HouseFarmGlassNoDistortion_01`, `SS_LampWallResidentialGlass_01`,
+`SS_StreetLampGlass_02`; 231 placements), so the loader guessed a texture by
+name: `T_HouseFarmGlass_C`, which is linear data (not sRGB colour) with
+mask-like channels (probably dirt). The farm glass material gives
+`BaseColor` 0.34 grey, `Opacity` 0.5, `Smoothness` 200, `CastShadow` false.
+
+Steps:
+1. `load.rs`: a material without a colour texture whose shader name
+   contains "glass" gets `Part::glass` (colour from `BaseColor`, opacity
+   from `Opacity`, variant values first; defaults 0.34 grey and 0.5 when the
+   material gives none) instead of a guessed texture.
+2. `main.rs`: glass parts use a blended StandardMaterial (smooth, both
+   sides) and cast no shadow. Collision and light probes are not changed.
+   `BF1_GLASS=off` for the old look.
+3. Later, if needed: the dirt mask (channel meaning not known).
+
+### Plan: terrain blend on mounds and dirt piles (2026-10-11; steps 1 and 2 done, step 3 waits for the user's view)
+
+The user: the dirt mounds look very off (real game: clods with leaves and
+moss that match the ground around them; rewrite: a smooth brown lump). The
+mound is the mesh `wf_earthmoundlarge_01_mesh` (438 placements). Its shader
+is `ObjectPreset_CS+N_TerrainBlend` with `UpNormalMaskEnable` true,
+`UpNormalMaskThreshold` 0.6, `UpNormalMaskOffset` 100,
+`TerrainBlendUpNormals` false, `TerrainBlendTextureMask` false (and
+`ForceTerrainRain` true on the base material). 15 placed meshes with 895
+placements use a terrain blend shader (MODLOG "footprints still not
+explained ... terrain blend on mounds"). Our reading (not confirmed; the rule
+is in the compiled shader): faces that point up more than the threshold take
+the ground layers of the terrain at the same x, z.
+
+Steps:
+1. `load.rs`: `Part::terrain_blend` (threshold, offset, flags) from the
+   material, the variant first, when its shader name contains
+   "terrainblend". Log the parts, placements and values.
+2. New material (`terrain_blend.rs`, `terrain_blend.wgsl`): Bevy's
+   StandardMaterial (the part's texture and normal map) plus the terrain's
+   ground textures and weight atlases (the same images, so no new memory).
+   In the shader: up = the world normal after the normal map, y component;
+   mask = smoothstep(threshold - 0.1, threshold + 0.1, up) (the width 0.1 is
+   a guess; the meaning of `UpNormalMaskOffset` is not known); faded out
+   with distance like the terrain detail (150 to 450 m). Colour, roughness
+   and normal come from the ground layers at the world point, mixed by the
+   mask. Only plain textured parts (no tint, no detail texture) in this
+   step. `BF1_TERRAIN_BLEND=off` for the old look.
+3. Check: view probe at the user's mound view (`-259.3,61.9,11.9,-223,-11`),
+   the number of materials (each is drawn as its own batch), the frame rate
+   at the user's spot; the look against the real game (the user).
+4. Later, separate steps: the mounds' Verdun variant (Xpack1 colour
+   texture); the `_DetailArray` variant (embedded stone walls); a blend near
+   the ground line, if the game has one.
+
+### Plan: fewer draw objects (merging static scenery) (2026-10-10; step 0 done, step 1 waits for the user)
+
+The frame is limited by the processor, not the graphics card (MODLOG
+"frame rate drop"): Bevy checks and lists every entity once per view (the
+camera and 4 sun shadow steps). Placed scenery is 8,481 placements as
+11,211 mesh entities (each under a parent entity), plus 4,096 terrain
+patches and 30,000 to 44,000 scatter instances. Idea: copy the triangles of
+nearby static parts with the same material into one mesh per map square,
+so Bevy handles far fewer entities. Costs: graphics memory (repeated meshes
+are copied; everything merged is about 1 GB, an estimate), coarser culling,
+load time. Decals, moving or breaking objects and the turning backdrop
+cards stay separate.
+
+Steps:
+0. Test first: `BF1_DRAW_SHARE=<percent>` draws only that share of the
+   placements (picked by a hash of the placement number, so the kept ones
+   spread over the whole map). Measure fps and graphics card time at the
+   user's spot for 100, 75, 50, 25 and 0%. If the frame time falls about
+   in line with the share, merging is worth it; if not, stop here.
+   Result (MODLOG "fewer draw objects, step 0"): 105, 118, 131, 143 and
+   181 fps; about 0.3 ms per 1,000 entities. A full merge copies 1.4 GB of
+   mesh data, so step 1 merges only meshes up to a size limit (64 KB:
+   6,478 entities, +112 MB; 256 KB: 3,380 entities, +612 MB).
+1. (Needs the user's OK.) Merge the static placed parts by material and
+   map square; `BF1_MERGE=off` for the old way. Check fps, graphics memory,
+   load time and a picture difference against the current version.
+2. (Optional) One mesh per scatter tile and kind for grass and debris.
+3. (Optional) Card turning in the shader, then merge the backdrop cards.
+
+### Plan: normal maps on models (2026-10-10)
+
+The user: the orchard stone wall looks nothing like the game (flat, no
+stones standing out). Found: we draw only the colour texture of models; the
+wall's material also names `T_WallStoneOrchard_01_N` (a normal map).
+Survey of the placed meshes' materials: 453 of 523 meshes (7,707 of 8,530
+placements) have a normal texture, mostly parameter `Normal` (also
+`_Normal`, `Base_Texture_N`, `TrunkNormal`, `TexNormalmap`,
+`Normal_MetalMask_AO`), with many endings (`_N`, `_NM`, `_NMA`, `_NA`,
+`_NR`, `_NRM`, `_ND`, `_NAA`, `_NMS`, `_NMO`, `_NTS`, ...). One example of
+each: red and green are the normal's x and y (99 to 100% of texels inside
+the unit circle; the tree billboard `_NNTS` 70%: not a plain normal map);
+blue and alpha differ by ending (z, metal, AO, roughness...). The meshes
+also store tangents (vertex usage 0x07) and a binormal sign (0x09).
+
+Steps:
+1. Plain textured parts: the normal texture (variant first; parameters
+   above; only if at least 95% of a small mip's red-green texels lie inside
+   the unit circle) and per-vertex tangents computed from the texture
+   coordinates (tangent along +u, sign so that the bitangent follows +v).
+   New material (StandardMaterial plus the normal texture): Bevy's own
+   `calculate_tbn_mikktspace` and `apply_normal_mapping` with z rebuilt from
+   red and green, and green flipped (the game's convention, as on the
+   terrain: +green = -v). Also for scatter parts. `BF1_NORMAL_MAPS=off` for
+   the old look. Done; then changed to BC5 two-channel textures with Bevy's
+   StandardMaterial (batched; the custom material cost about 20% frame
+   rate; MODLOG "frame rate drop"). Check: number of parts, the wall view against the game
+   screenshot (contrast, detail), the light probe fingerprint (unchanged).
+2. Later: the same for painted, detail and foliage parts; smoothness from
+   `_CS` alpha.
+
+### Plan: shiny leaves and wet ground (2026-10-10)
+
+The user: the ivy, the ground foliage and the moist spots on the ground do
+not reflect the sun as in the game. Found: all meshes and scatter are drawn
+with a fixed roughness 0.85 (smoothness 0.15). Foliage materials name a
+second texture: `NormalTranslucencySmoothnessMap` (scatter) or
+`TexNormalmap` (`..._NTS`, vegetation). On ivy leaf pixels its channels are
+red, green about 0.5 (a normal map), blue 0.70, alpha 0.35 (empty pixels:
+blue 0.995, alpha 0.10); the ground ivy's `_NNRS` alpha is 0.59 on leaves.
+We read alpha as smoothness (the parameter name says so).
+
+Steps:
+1. Shiny leaves: a material for parts whose material has such a texture
+   (parameter name with "Smoothness", or a texture name ending `_NTS` or
+   `_NNRS`): Bevy's StandardMaterial (same colour texture and cut-out) plus
+   the texture; the shader sets roughness = 1 - alpha. Also for the scatter.
+   `BF1_SHINY_LEAVES=off` for the old fixed roughness. Check: parts and
+   scatter kinds that get it, the screenshot of the ivy tree and of ground
+   ivy in the sun against before.
+2. Wet ground: check that the ground's smoothness reaches the light; the
+   game also reflects the sky in wet spots, which we do not have (no
+   environment map). Measure first, then plan.
+
+Later: the same alpha-as-smoothness for buildings (`_CS` textures), the
+normal maps and translucency of leaves.
+
+### Plan: layers carried from coarser levels (2026-10-10; step 1 failed, attempt 2 done, see MODLOG)
+
+Found (MODLOG "missing forest on the far hills"): a finer mask patch seems
+to list only the layers with new detail; layers it does not list carry on
+from coarser levels. We use only the finest patch, so we lose the backdrop
+forest (layer 16, present at levels 0 to 2 on the hill north of the
+attacker spawn) and leave points with no layer at all (1.8% of the battle
+area, 0.8% of the map).
+
+Steps:
+1. `weights_at`: for each layer, the mask of the finest patch that lists
+   it (else 0); mixed in ascending layer order (the record order). Switch
+   `BF1_MASK_INHERIT=off` for the old rule.
+2. Check: the "no textured layer" share (should fall to about 0), the
+   backdrop tree count, the light probe fingerprint (unchanged; masks are
+   not in it), a ground screenshot near the battle area against before
+   (should change little), the user's hill view.
+3. Later, if needed: the record's 85-bit quadtree for exactly where a
+   layer is refined.
+
+### Plan: faster start (2026-10-10; steps 1 to 5 done, more in MODLOG; step 6 waits for the user)
+
+Measured (game log, 20.6 s to the first frame): archive index 0.8 s, EBX
+1.2 s, meshes and textures 1.1 s, shader database and ground 0.7 s, a gap
+of 1.2 s with no log line, light probes 13.2 s (64%), the rest 1.6 s.
+
+Steps:
+1. Light probe cache: the baked boxes (about 19 MB) go to
+   `cache/light_probes.bin` (git ignores it, like `logs`). The file holds a
+   fingerprint of everything the bake reads: a code version number, the
+   probe constants, the map centre, the terrain heights, each mesh's name,
+   vertices, triangles and cut-out and decal flags, and every placement.
+   A matching file is loaded instead of baking; otherwise the bake runs and
+   the file is written. `BF1_PROBE_CACHE=off` always bakes;
+   `BF1_PROBE_CACHE=verify` bakes, loads, and logs whether they are equal.
+   The version number must go up when the bake code changes.
+2. Find the 1.2 s gap (log when the scene setup starts).
+3. Then measure again and decide on the next step (for example running
+   independent loading steps in parallel).
+
+After steps 1 and 2 (first smooth frame at about 8.5 s): loading 4.1 s
+(index 0.8, EBX 1.2, meshes 1.1), Bevy's own start 1.2 s, scene setup
+1.6 s (terrain mesh 1.0), first frames 1.1 s. Next steps, one at a time,
+each checked by the light probe fingerprint (`2b3b801088956a63` must stay
+the same: same meshes, placements and terrain):
+4. EBX: read, unpack and parse the partitions on all cores, then add them
+   in the same order as before (first of a name wins, as before).
+5. Archive index: read the `cas.cat` and `.toc` files on all cores, then
+   add them in the same order (Data first, then Patch).
+6. Start Bevy while the level loads (the 1.2 s overlap); larger change,
+   only after asking.
+
 ### Plan: decal variants (object variations) (2026-10-10; done except step 6, which the data rejected; see MODLOG)
 
 The 117 generic decals (`decal_128x128_mesh`) all show their default dirt

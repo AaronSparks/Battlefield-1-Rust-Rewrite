@@ -87,12 +87,17 @@ impl GameFs {
             cat_paths.sort();
             for path in cat_paths {
                 let catf = cat::read_cat(&path)?;
+                // Archive id per cas number of this cat: the path is built and
+                // looked up once per archive, not once per entry (faster start).
+                let mut local: HashMap<u32, u32> = HashMap::new();
                 for e in &catf.entries {
-                    let cas_path = catf.cas_path(e.cas_number);
-                    let next = cas_ids.len() as u32;
-                    let id = *cas_ids.entry(cas_path.clone()).or_insert_with(|| {
-                        fs.cas_files.push(cas_path);
-                        next
+                    let id = *local.entry(e.cas_number).or_insert_with(|| {
+                        let cas_path = catf.cas_path(e.cas_number);
+                        let next = cas_ids.len() as u32;
+                        *cas_ids.entry(cas_path.clone()).or_insert_with(|| {
+                            fs.cas_files.push(cas_path);
+                            next
+                        })
                     });
                     // The same sha1 can be in several cats, and some copies hold only a
                     // tail range of the data (seen for streamed textures). Keep the largest.

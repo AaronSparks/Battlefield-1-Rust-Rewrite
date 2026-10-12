@@ -5,7 +5,7 @@
 use crate::Log;
 use anyhow::{Context, Result};
 use fb_vfs::GameFs;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub fn cmd_terrain_scan(log: &mut Log, root: &std::path::Path, superbundle: &str, file: &str) -> Result<()> {
     let mut fs = GameFs::open(root)?;
@@ -590,6 +590,137 @@ pub fn cmd_terrain(log: &mut Log, root: &std::path::Path, superbundle: &str, lev
 /// Ground layers around a point: the share of each layer (sum of mask
 /// weights) in a square of `radius` metres, and a map of the strongest layer
 /// per `step` metres (rows = z rising, columns = x rising; '.' = none).
+/// `layer-combos <superbundle>`: do the layer numbers of the mask records
+/// match the layer numbers in the terrain shader names? Each patch's set of
+/// layers is compared with the 185 shader layer sets (exact match, or a
+/// shader set that contains it), per quadtree level. Also counts, per layer,
+/// the patches that list it and the shaders that name it.
+pub fn cmd_layer_combos(log: &mut Log, root: &std::path::Path, superbundle: &str, swaps: &[(u8, u8)]) -> Result<()> {
+    use fb_ebx::Value;
+    use std::collections::{BTreeSet, HashSet};
+    let mut fs = GameFs::open(root)?;
+    fs.index_toc_chunks()?;
+    let world = fb_level::World::load(&fs, &[superbundle])?;
+    let (terrain, _) = load_terrain(&fs, &world)?;
+    let lm = terrain.layers.as_ref().context("no layer masks")?;
+    let part = (0..world.partitions.len())
+        .find(|&i| world.partitions[i].primary().is_some_and(|p| p.value.type_name == "TerrainData"))
+        .context("no TerrainData")?;
+    let Some(Value::ResourceRef(rid)) = world.partitions[part].primary().and_then(|p| p.value.get("TerrainLayerCombinationsResource")).cloned() else {
+        anyhow::bail!("no TerrainLayerCombinationsResource")
+    };
+    let shaders = fb_res::shaderdb::terrain_colour_shaders(&world.read_res(&fs, rid)?);
+    let sets: HashSet<BTreeSet<u8>> = shaders.iter().map(|(_, l)| l.iter().copied().collect()).collect();
+    log.line(format!("{} shader names, {} different layer sets; record layers exchanged: {swaps:?}", shaders.len(), sets.len()));
+    // Layers that no shader names (scatter-only layers) are left out of the patch sets.
+    let named: HashSet<u8> = shaders.iter().flat_map(|(_, l)| l.iter().copied()).collect();
+    // --dump <file>: shader sets ("S 0 2 11") and patch sets ("P <level> 0 4 ...", record numbers, all layers).
+    if let Some(path) = std::env::args().skip_while(|a| a != "--dump").nth(1) {
+        let mut out = String::new();
+        for (_, l) in &shaders {
+            out.push_str(&format!("S {}
+", l.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ")));
+        }
+        for (&(level, _, _), layers) in &lm.patches {
+            out.push_str(&format!("P {level} {}
+", layers.iter().map(|pl| pl.layer.to_string()).collect::<Vec<_>>().join(" ")));
+        }
+        std::fs::write(&path, out)?;
+        log.line(format!("wrote {path}"));
+    }
+    let mut per_level: BTreeMap<u32, (usize, usize, usize)> = BTreeMap::new();
+    let mut unmatched: BTreeMap<String, usize> = BTreeMap::new();
+    let mut patches_with: BTreeMap<u8, usize> = BTreeMap::new();
+    for (&(level, _, _), layers) in &lm.patches {
+        // Test: --swap a,b exchanges two record layer numbers before the comparison.
+        let swap = |l: u8| swaps.iter().fold(l, |l, &(a, b)| if l == a { b } else if l == b { a } else { l });
+        let set: BTreeSet<u8> = layers.iter().map(|pl| swap(pl.layer)).filter(|l| named.contains(l)).collect();
+        if set.is_empty() {
+            continue;
+        }
+        for &l in &set {
+            *patches_with.entry(l).or_default() += 1;
+        }
+        let e = per_level.entry(level).or_default();
+        e.0 += 1;
+        if sets.contains(&set) {
+            e.1 += 1;
+        } else if sets.iter().any(|s| set.is_subset(s)) {
+            e.2 += 1;
+        } else {
+            *unmatched.entry(format!("{set:?}")).or_default() += 1;
+        }
+    }
+    for (level, (n, exact, subset)) in &per_level {
+        log.line(format!("level {level}: {n} patches, layer set equals a shader set {exact}, inside a shader set {subset}, neither {}", n - exact - subset));
+    }
+    let mut top: Vec<_> = unmatched.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    for (set, n) in top.iter().take(12) {
+        log.line(format!("  no shader for {set}: {n} patches"));
+    }
+    let mut shaders_with: BTreeMap<u8, usize> = BTreeMap::new();
+    for (_, l) in &shaders {
+        for &x in l {
+            *shaders_with.entry(x).or_default() += 1;
+        }
+    }
+    let layers: BTreeSet<u8> = patches_with.keys().chain(shaders_with.keys()).copied().collect();
+    let list: Vec<String> = layers.iter().map(|l| format!("{l}: {}/{}", patches_with.get(l).unwrap_or(&0), shaders_with.get(l).unwrap_or(&0))).collect();
+    log.line(format!("per layer (patches listing it / shaders naming it): {}", list.join(", ")));
+    Ok(())
+}
+
+/// `layer-colours <superbundle> <texture>...`: for each layer, the mean
+/// colour of the terrain colour map (the game's baked far colour, sRGB) at
+/// points where the layer's mixed weight is over 0.8 (8 m grid, whole map),
+/// and the mean sRGB colour of each named texture. A layer's colour-map
+/// colour should be close to its own texture's colour.
+pub fn cmd_layer_colours(log: &mut Log, root: &std::path::Path, superbundle: &str, textures: &[String]) -> Result<()> {
+    let mut fs = GameFs::open(root)?;
+    fs.index_toc_chunks()?;
+    let world = fb_level::World::load(&fs, &[superbundle])?;
+    let (terrain, _) = load_terrain(&fs, &world)?;
+    let lm = terrain.layers.as_ref().context("no layer masks")?;
+    let skip = [false; fb_terrain::layers::MAX_LAYERS];
+    let mut w = [0f32; fb_terrain::layers::MAX_LAYERS];
+    let mut sum = [[0f64; 3]; fb_terrain::layers::MAX_LAYERS];
+    let mut count = [0usize; fb_terrain::layers::MAX_LAYERS];
+    let mut decoded: HashMap<usize, Vec<[u8; 3]>> = HashMap::new();
+    let step = 8.0f32;
+    let n = (lm.width / step) as i32;
+    for iz in 0..n {
+        for ix in 0..n {
+            let (x, z) = (lm.min[0] + (ix as f32 + 0.5) * step, lm.min[1] + (iz as f32 + 0.5) * step);
+            if lm.weights_at(x, z, &skip, &mut w).is_none() {
+                continue;
+            }
+            let Some(best) = (0..w.len()).find(|&l| w[l] > 0.8) else { continue };
+            let Some((tile, uv)) = terrain.colour_at(x, z) else { continue };
+            let px = decoded.entry(tile).or_insert_with(|| fb_terrain::decode_colour(&terrain.colours[tile].data));
+            let s = fb_terrain::COLOUR_SIZE;
+            let c = px[((uv[1] * s as f32) as usize).min(s - 1) * s + ((uv[0] * s as f32) as usize).min(s - 1)];
+            for k in 0..3 {
+                sum[best][k] += f64::from(c[k]);
+            }
+            count[best] += 1;
+        }
+    }
+    for l in 0..fb_terrain::layers::MAX_LAYERS {
+        if count[l] > 0 {
+            let m = sum[l].map(|v| v / count[l] as f64);
+            log.line(format!("layer {l:2}: colour map where dominant: sRGB [{:.0}, {:.0}, {:.0}] at {} points (8 m grid)", m[0], m[1], m[2], count[l]));
+        }
+    }
+    for t in textures {
+        match crate::meshes::texture_mean_srgb(&fs, &world, t) {
+            Ok(m) => log.line(format!("texture {}: mean sRGB [{:.0}, {:.0}, {:.0}]", t.rsplit('/').next().unwrap_or(t), m[0], m[1], m[2])),
+            Err(e) => log.line(format!("texture {t}: {e:#}")),
+        }
+    }
+    Ok(())
+}
+
 pub fn cmd_layer_grid(log: &mut Log, root: &std::path::Path, superbundle: &str, x: f32, z: f32, radius: f32, step: f32) -> Result<()> {
     let mut fs = GameFs::open(root)?;
     fs.index_toc_chunks()?;
@@ -623,9 +754,174 @@ pub fn cmd_layer_grid(log: &mut Log, root: &std::path::Path, superbundle: &str, 
     let total: f64 = share.iter().sum();
     let list: Vec<String> = share.iter().enumerate().filter(|(_, s)| **s > 0.0).map(|(l, s)| format!("layer {l}: {:.1}%", 100.0 * s / total.max(1e-9))).collect();
     log.line(format!("terrain height at ({x}, {z}): {:?}", terrain.height_at(x, z)));
+    // The terrain colour map (far ground colour) per grid row: mean sRGB and
+    // the colour tile levels used.
+    let mut decoded: HashMap<usize, Vec<[u8; 3]>> = HashMap::new();
+    for j in 0..=n {
+        let pz = z - radius + j as f32 * step;
+        let (mut sum, mut count) = ([0u64; 3], 0u64);
+        let mut levels_used: BTreeMap<u32, usize> = BTreeMap::new();
+        for i in 0..=n {
+            let px = x - radius + i as f32 * step;
+            let Some((tile, uv)) = terrain.colour_at(px, pz) else { continue };
+            let px_data = decoded.entry(tile).or_insert_with(|| fb_terrain::decode_colour(&terrain.colours[tile].data));
+            let s = fb_terrain::COLOUR_SIZE;
+            let (cx, cz) = (((uv[0] * s as f32) as usize).min(s - 1), ((uv[1] * s as f32) as usize).min(s - 1));
+            let c = px_data[cz * s + cx];
+            for k in 0..3 {
+                sum[k] += c[k] as u64;
+            }
+            count += 1;
+            *levels_used.entry(terrain.colours[tile].level).or_default() += 1;
+        }
+        if count > 0 && j % 4 == 0 {
+            log.line(format!("  colour map z {pz:>7.1}: mean sRGB [{}, {}, {}], tile levels {levels_used:?}", sum[0] / count, sum[1] / count, sum[2] / count));
+        }
+    }
     log.line(format!("layers within {radius} m of ({x}, {z}), {step} m grid: {}; mask level used {levels:?}", list.join(", ")));
+    // Each layer's own mask (not mixed): mean, and the share of points above
+    // 0, 0.25 and 0.5; against the mixed weight.
+    for layer in 0..fb_terrain::layers::MAX_LAYERS as u8 {
+        let (mut sum, mut mixed, mut pts, mut a0, mut a25, mut a50) = (0f64, 0f64, 0usize, 0usize, 0usize, 0usize);
+        for j in 0..=n {
+            for i in 0..=n {
+                let (px, pz) = (x - radius + i as f32 * step, z - radius + j as f32 * step);
+                let Some(r) = lm.raw_weight_at(px, pz, layer) else { continue };
+                if lm.weights_at(px, pz, &skip, &mut w).is_some() {
+                    mixed += f64::from(w[layer as usize]);
+                }
+                pts += 1;
+                sum += f64::from(r);
+                a0 += usize::from(r > 0.0);
+                a25 += usize::from(r > 0.25);
+                a50 += usize::from(r > 0.5);
+            }
+        }
+        if a0 > 0 || (12..=17).contains(&layer) {
+            // Per quadtree level: mean own mask and share above 0.25.
+            let mut per_level = Vec::new();
+            for level in 0..=lm.finest {
+                let (mut s, mut c, mut hi) = (0f64, 0usize, 0usize);
+                for j in 0..=n {
+                    for i in 0..=n {
+                        let (px, pz) = (x - radius + i as f32 * step, z - radius + j as f32 * step);
+                        if let Some(r) = lm.raw_weight_at_level(px, pz, layer, level) {
+                            s += f64::from(r);
+                            c += 1;
+                            hi += usize::from(r > 0.25);
+                        }
+                    }
+                }
+                if c > 0 {
+                    per_level.push(format!("L{level} {:.3}/{:.0}%", s / c as f64, 100.0 * hi as f64 / c as f64));
+                }
+            }
+            log.line(format!("  layer {layer:>2} own mask by level (mean/above 0.25): {}", per_level.join(", ")));
+        }
+        if a0 > 0 {
+            let pc = |k: usize| 100.0 * k as f64 / pts.max(1) as f64;
+            log.line(format!(
+                "  layer {layer:>2} own mask: mean {:.3}, above 0 {:.0}%, above 0.25 {:.0}%, above 0.5 {:.0}%; mixed weight mean {:.3}",
+                sum / pts as f64, pc(a0), pc(a25), pc(a50), mixed / pts as f64
+            ));
+        }
+    }
     for (j, r) in rows.iter().enumerate() {
         log.line(format!("  z {:>7.1}: {r}", z - radius + j as f32 * step));
+    }
+    Ok(())
+}
+
+/// Study of the 11 record bytes after `full` (DESIGN.md "layers carried from
+/// coarser levels"): compare their 84 sub-cell bits (4 + 16 + 64 cells below
+/// the record's patch) with (a) "a finer patch has its own record of this
+/// layer there" and (b) "this record's own mask is not zero in that cell",
+/// for several bit orders. Prints the share of bits that agree.
+pub fn cmd_mask_bits(log: &mut Log, root: &std::path::Path, superbundle: &str) -> Result<()> {
+    use fb_terrain::layers::{MASK_SIZE, MAX_LAYERS};
+    use std::collections::HashSet;
+    let mut fs = GameFs::open(root)?;
+    fs.index_toc_chunks()?;
+    let world = fb_level::World::load(&fs, &[superbundle])?;
+    let (terrain, _) = load_terrain(&fs, &world)?;
+    let lm = terrain.layers.as_ref().context("no layer masks")?;
+    let present: HashSet<(u32, u32, u32, u8)> = lm.records.iter().map(|r| {
+        let (l, x, z) = lm.patch_of(r);
+        (l, x, z, r.layer)
+    }).collect();
+    let _ = MAX_LAYERS;
+    // Orders of the cells of one depth: 0 = row (z) major, 1 = column (x) major, 2 = Morton (x low bit first).
+    let cell_index = |order: u32, n: u32, i: u32, j: u32| -> u32 {
+        match order {
+            0 => j * n + i,
+            1 => i * n + j,
+            _ => {
+                let mut m = 0;
+                for b in 0..8 {
+                    m |= ((i >> b) & 1) << (2 * b);
+                    m |= ((j >> b) & 1) << (2 * b + 1);
+                }
+                m
+            }
+        }
+    };
+    let bit = |tree: &[u8; 11], k: u32, msb: bool| -> bool {
+        let byte = tree[(k / 8) as usize];
+        if msb { (byte >> (7 - k % 8)) & 1 == 1 } else { (byte >> (k % 8)) & 1 == 1 }
+    };
+    // agree[meaning][order][msb]
+    let mut agree = [[[0u64; 2]; 3]; 2];
+    let mut total = 0u64;
+    let mut ones = 0u64;
+    let mut self_bit = [0u64; 2];
+    let mut per_depth_true = [[0u64; 3]; 2];
+    for r in &lm.records {
+        let (l, px, pz) = lm.patch_of(r);
+        // Own mask, if stored and usable.
+        let mask = lm.patches.get(&(l, px, pz)).and_then(|v| v.iter().find(|pl| pl.layer == r.layer)).and_then(|pl| pl.mask).map(|i| lm.mask(i));
+        self_bit[0] += u64::from(bit(&r.tree, 0, false));
+        self_bit[1] += u64::from(bit(&r.tree, 0, true));
+        for d in 1..=3u32 {
+            let n = 1u32 << d;
+            let base = (0..d).map(|k| 1u32 << (2 * k)).sum::<u32>(); // 1, 5, 21
+            for j in 0..n {
+                for i in 0..n {
+                    let a = present.contains(&(l + d, px * n + i, pz * n + j, r.layer));
+                    let b = match mask {
+                        None => r.full,
+                        Some(m) => {
+                            let cells = 64 / n as usize;
+                            let (x0, z0) = (i as usize * cells, j as usize * cells);
+                            (z0..=z0 + cells).any(|zz| (x0..=x0 + cells).any(|xx| m[zz.min(MASK_SIZE - 1) * MASK_SIZE + xx.min(MASK_SIZE - 1)] > 0))
+                        }
+                    };
+                    per_depth_true[0][d as usize - 1] += u64::from(a);
+                    per_depth_true[1][d as usize - 1] += u64::from(b);
+                    total += 1;
+                    for order in 0..3 {
+                        for msb in [false, true] {
+                            let k = base + cell_index(order, n, i, j);
+                            let v = bit(&r.tree, k, msb);
+                            if order == 0 && !msb {
+                                ones += u64::from(v);
+                            }
+                            agree[0][order as usize][usize::from(msb)] += u64::from(v == a);
+                            agree[1][order as usize][usize::from(msb)] += u64::from(v == b);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    log.line(format!("records {}, sub-cell bits {total}, bits set (row order, low bit first) {:.1}%", lm.records.len(), 100.0 * ones as f64 / total.max(1) as f64));
+    log.line(format!("bit 0 set: low bit first {:.1}%, high bit first {:.1}%", 100.0 * self_bit[0] as f64 / lm.records.len() as f64, 100.0 * self_bit[1] as f64 / lm.records.len() as f64));
+    log.line(format!("true share by depth (1, 2, 3): (a) finer record {:?}, (b) own mask not zero {:?}", per_depth_true[0], per_depth_true[1]));
+    for (mi, meaning) in ["(a) finer record of the layer", "(b) own mask not zero"].iter().enumerate() {
+        for (oi, order) in ["row", "column", "Morton"].iter().enumerate() {
+            for (bi, b) in ["low bit first", "high bit first"].iter().enumerate() {
+                log.line(format!("  {meaning}, {order} order, {b}: {:.1}% agree", 100.0 * agree[mi][oi][bi] as f64 / total.max(1) as f64));
+            }
+        }
     }
     Ok(())
 }

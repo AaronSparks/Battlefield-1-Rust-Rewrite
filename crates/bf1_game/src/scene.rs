@@ -81,6 +81,11 @@ pub fn spawn_scene(
         _ => (centre.0 + Vec3::new(0.0, 2.0, 0.0), 0.0, 0.0),
     };
     log.line(format!("camera start {start:.1}, yaw {:.0} deg, pitch {:.0} deg", yaw.to_degrees(), pitch.to_degrees()));
+    log.line(format!(
+        "camera field of view: {:.1} deg vertical ({:.1} deg horizontal at 16:9); the game's setting 100 (Hor+ 116) unless BF1_GAME_FOV or BF1_FOV is set",
+        fov().to_degrees(),
+        (2.0 * ((fov() / 2.0).tan() * 16.0 / 9.0).atan()).to_degrees()
+    ));
 
     // Camera with fog, bloom, tone mapping, ambient occlusion and anti-aliasing.
     let mut cam = commands.spawn((
@@ -114,7 +119,14 @@ pub fn spawn_scene(
     commands.spawn((
         DirectionalLight { color: sun_colour, illuminance: e.map(|e| e.sun_intensity).unwrap_or(100_000.0) * sun_scale(), shadow_maps_enabled: true, ..default() },
         Transform::default().looking_to(-to_sun, Vec3::Y),
-        CascadeShadowConfigBuilder { maximum_distance: 200.0, first_cascade_far_bound: 15.0, ..default() }.build(),
+        CascadeShadowConfigBuilder {
+            maximum_distance: 200.0,
+            first_cascade_far_bound: 15.0,
+            // Test switch: BF1_SHADOW_CASCADES=<n> (Bevy's default is 4).
+            num_cascades: std::env::var("BF1_SHADOW_CASCADES").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+            ..default()
+        }
+        .build(),
     ));
     log.line(format!("sun: direction to sun (Bevy) {to_sun:.3}"));
     log.line(format!(
@@ -218,10 +230,44 @@ pub fn cycle_weather(
     ));
 }
 
-/// Vertical field of view: Bevy's default (45 degrees), or
-/// `BF1_FOV=<degrees>` (to match a reference screenshot).
-fn fov() -> f32 {
-    std::env::var("BF1_FOV").ok().and_then(|v| v.parse::<f32>().ok()).map(f32::to_radians).unwrap_or(std::f32::consts::FRAC_PI_4)
+/// The game's field of view setting used for the user's screenshots
+/// (Battlefield 1 options: "Field of view 100 (Hor+ 116)").
+const GAME_FOV: f32 = 100.0;
+
+/// Vertical field of view (radians) for a Battlefield 1 field of view
+/// setting. The setting is the horizontal angle of a 4:3 picture; wider
+/// pictures see more at the sides ("Hor+"), so the vertical angle stays
+/// fixed: 2 atan(tan(setting / 2) * 3 / 4). 100 gives 83.6 degrees vertical,
+/// 115.6 degrees horizontal at 16:9 (the game shows 116).
+pub fn vertical_fov_from_game(setting_degrees: f32) -> f32 {
+    2.0 * ((setting_degrees.to_radians() / 2.0).tan() * 0.75).atan()
+}
+
+/// Vertical field of view (radians): the game's setting (`GAME_FOV`, or
+/// `BF1_GAME_FOV=<setting>`), or `BF1_FOV=<vertical degrees>` directly.
+pub fn fov() -> f32 {
+    let env = |n: &str| std::env::var(n).ok().and_then(|v| v.parse::<f32>().ok());
+    match env("BF1_FOV") {
+        Some(v) => v.to_radians(),
+        None => vertical_fov_from_game(env("BF1_GAME_FOV").unwrap_or(GAME_FOV)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn game_fov_100_is_hor_plus_116() {
+        let v = vertical_fov_from_game(100.0);
+        assert!((v.to_degrees() - 83.62).abs() < 0.05, "{}", v.to_degrees());
+        // Horizontal angle at 16:9 with that vertical angle.
+        let h = 2.0 * ((v / 2.0).tan() * 16.0 / 9.0).atan();
+        assert!((h.to_degrees() - 115.6).abs() < 0.1, "{}", h.to_degrees());
+        // 4:3 gives the setting back.
+        let h43 = 2.0 * ((v / 2.0).tan() * 4.0 / 3.0).atan();
+        assert!((h43.to_degrees() - 100.0).abs() < 0.01);
+    }
 }
 
 /// The level's SunIntensity (100,000 on Verdun) used as lux makes the sunlit

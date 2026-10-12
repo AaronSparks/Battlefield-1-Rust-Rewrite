@@ -26,6 +26,9 @@ pub struct Options {
     /// variants"): "decals" (meshes under `artassets/decals`), "all" or
     /// "off"; `BF1_VARIATIONS=<mode>`.
     pub variations: String,
+    /// Glass without a colour texture is drawn see-through (DESIGN.md
+    /// "window glass"); `BF1_GLASS=off` guesses a texture as before.
+    pub glass: bool,
 }
 
 impl Default for Options {
@@ -40,6 +43,7 @@ impl Default for Options {
             texture_mip_skip: 1,
             ground_mip_skip: std::env::var("BF1_GROUND_MIP_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
             variations: std::env::var("BF1_VARIATIONS").unwrap_or_else(|_| "decals".into()).to_lowercase(),
+            glass: std::env::var("BF1_GLASS").map_or(true, |v| v != "off"),
         }
     }
 }
@@ -70,6 +74,110 @@ pub struct Part {
     /// Set for parts from the "transparent decal" category: drawn blended
     /// over other surfaces (DESIGN.md "decal variants", step 7).
     pub decal: Option<DecalLook>,
+    /// Foliage: texture whose alpha is the smoothness (DESIGN.md "shiny
+    /// leaves and wet ground"), index into `Loaded::textures`.
+    pub smoothness: Option<usize>,
+    /// Normal texture (red, green = x, y), index into `Loaded::textures`
+    /// (DESIGN.md "normal maps on models").
+    pub normal_map: Option<usize>,
+    /// Per-vertex tangents for the normal map (xyz along +u, w = sign so
+    /// that w * cross(normal, tangent) follows +v); empty without a normal map.
+    pub tangents: Vec<[f32; 4]>,
+    /// Set for parts whose shader blends in the terrain's ground layers
+    /// (DESIGN.md "terrain blend on mounds").
+    pub terrain_blend: Option<TerrainBlend>,
+    /// Set for glass without a colour texture (DESIGN.md "window glass").
+    pub glass: Option<GlassLook>,
+}
+
+/// How a glass part is drawn (DESIGN.md "window glass"): see-through, with
+/// the material's colour and opacity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlassLook {
+    /// `BaseColor` (linear); 0.34 grey when the material gives none.
+    pub colour: [f32; 3],
+    /// `Opacity`; 0.5 when the material gives none.
+    pub opacity: f32,
+}
+
+/// The glass look of a material and its variant (the variant's values
+/// first), if the shader name contains "glass".
+fn glass_look(world: &World, mat: (usize, usize), var: Option<(usize, usize)>) -> Option<GlassLook> {
+    let shader = var.and_then(|v| shader_name(world, v)).or_else(|| shader_name(world, mat))?;
+    if !shader.rsplit('/').next().unwrap_or("").to_ascii_lowercase().contains("glass") {
+        return None;
+    }
+    let mut g = GlassLook { colour: [0.342; 3], opacity: 0.5 };
+    // The material's values, then the variant's on top.
+    for m in std::iter::once(mat).chain(var) {
+        let Some(Value::Struct(sh)) = world.get(m).get("Shader") else { continue };
+        let Some(Value::Array { items, .. }) = sh.get("VectorParameters") else { continue };
+        for v in items {
+            let Value::Struct(v) = v else { continue };
+            let (Some(Value::String(name)), Some(Value::Struct(x))) = (v.get("ParameterName"), v.get("Value")) else { continue };
+            let f = |n: &str| match x.get(n) {
+                Some(Value::Float(f)) => Some(*f as f32),
+                _ => None,
+            };
+            match (name.as_str(), f("x"), f("y"), f("z")) {
+                ("BaseColor", Some(r), Some(gr), Some(b)) => g.colour = [r, gr, b],
+                ("Opacity", Some(o), _, _) => g.opacity = o.clamp(0.0, 1.0),
+                _ => {}
+            }
+        }
+    }
+    Some(g)
+}
+
+/// Values of a terrain blend shader (`ObjectPreset_..._TerrainBlend...`;
+/// DESIGN.md "terrain blend on mounds"). Our reading, not confirmed: faces
+/// that point up more than `threshold` take the terrain's ground layers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerrainBlend {
+    /// `UpNormalMaskEnable`.
+    pub up_mask: bool,
+    /// `UpNormalMaskThreshold`: the up component of the normal where the blend starts.
+    pub threshold: f32,
+    /// `UpNormalMaskOffset` (meaning not known; for the log).
+    pub offset: f32,
+    /// `TerrainBlendUpNormals` and `TerrainBlendTextureMask` (meaning not known; for the log).
+    pub up_normals: bool,
+    pub texture_mask: bool,
+}
+
+/// The terrain blend values of a material and its variant (the variant's
+/// values first), if either names a terrain blend shader.
+fn terrain_blend(world: &World, mat: (usize, usize), var: Option<(usize, usize)>) -> Option<TerrainBlend> {
+    let shader = var.and_then(|v| shader_name(world, v)).or_else(|| shader_name(world, mat))?;
+    if !shader.to_ascii_lowercase().contains("terrainblend") {
+        return None;
+    }
+    // One parameter value from the variant, else from the material.
+    let find = |list: &str, name: &str| -> Option<Value> {
+        var.into_iter().chain(std::iter::once(mat)).find_map(|m| {
+            let Some(Value::Struct(sh)) = world.get(m).get("Shader") else { return None };
+            let Some(Value::Array { items, .. }) = sh.get(list) else { return None };
+            items.iter().find_map(|v| {
+                let Value::Struct(v) = v else { return None };
+                matches!(v.get("ParameterName"), Some(Value::String(n)) if n == name).then(|| v.get("Value").cloned()).flatten()
+            })
+        })
+    };
+    let flag = |name: &str| matches!(find("BoolParameters", name), Some(Value::Bool(true)));
+    let scalar = |name: &str, default: f32| match find("VectorParameters", name) {
+        Some(Value::Struct(x)) => match x.get("x") {
+            Some(Value::Float(f)) => *f as f32,
+            _ => default,
+        },
+        _ => default,
+    };
+    Some(TerrainBlend {
+        up_mask: flag("UpNormalMaskEnable"),
+        threshold: scalar("UpNormalMaskThreshold", 0.6),
+        offset: scalar("UpNormalMaskOffset", 0.0),
+        up_normals: flag("TerrainBlendUpNormals"),
+        texture_mask: flag("TerrainBlendTextureMask"),
+    })
 }
 
 /// How a decal part is drawn (DESIGN.md "decal variants", step 7).
@@ -103,6 +211,218 @@ fn decal_params(world: &World, mat: (usize, usize)) -> DecalLook {
         }
     }
     p
+}
+
+/// A material's normal texture (DESIGN.md "normal maps on models"): the
+/// parameters the Verdun materials use for their main normal map (not the
+/// detail or tile-breaker ones).
+fn normal_texture(world: &World, mat: (usize, usize)) -> Option<(usize, usize)> {
+    const NAMES: [&str; 8] = ["Normal", "_Normal", "Base_Texture_N", "TrunkNormal", "TexNormalmap", "Normal_MetalMask_AO", "NormalMap", "Normals"];
+    NAMES.iter().find_map(|n| texture_parameter(world, mat, n))
+}
+
+/// True if red and green hold a plain normal: at least 95% of a small mip's
+/// texels have (2r - 1)^2 + (2g - 1)^2 <= 1.05.
+fn is_normal_map(t: &TextureData) -> bool {
+    let Some(px) = small_mip(t, 64) else { return false };
+    let inside = px
+        .iter()
+        .filter(|p| {
+            let (x, y) = (p[0] as f32 / 127.5 - 1.0, p[1] as f32 / 127.5 - 1.0);
+            x * x + y * y <= 1.05
+        })
+        .count();
+    inside as f32 >= 0.95 * px.len().max(1) as f32
+}
+
+/// Normal maps as two-channel BC5 (red, green only; DESIGN.md "normal maps
+/// on models"): Bevy's StandardMaterial then rebuilds z itself, so the
+/// normal-mapped parts can share its batched (bindless) drawing. A texture
+/// that is also used for something else gets a converted copy.
+fn convert_normal_maps(loaded: &mut Loaded, log: &GameLog) {
+    let t = Instant::now();
+    let mut normal: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut other: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for p in loaded.meshes.iter().flat_map(|m| &m.parts) {
+        normal.extend(p.normal_map);
+        other.extend(p.texture);
+        other.extend(p.smoothness);
+        other.extend(p.tint.and_then(|t| t.mask));
+        if let Some(d) = p.detail {
+            other.insert(d.texture);
+            other.insert(d.mask);
+        }
+    }
+    for g in &loaded.ground {
+        other.insert(g.texture);
+        other.extend(g.nrh);
+    }
+    let list: Vec<usize> = normal.into_iter().collect();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32);
+    let textures = &loaded.textures;
+    let converted: Vec<(usize, Option<TextureData>)> = std::thread::scope(|sc| {
+        let jobs: Vec<_> = list
+            .chunks(list.len().div_ceil(threads).max(1))
+            .map(|part| sc.spawn(move || part.iter().map(|&j| (j, to_bc5(&textures[j]))).collect::<Vec<_>>()))
+            .collect();
+        jobs.into_iter().flat_map(|j| j.join().unwrap_or_default()).collect()
+    });
+    let (mut in_place, mut copies, mut failed) = (0usize, 0usize, 0usize);
+    let mut remap: HashMap<usize, Option<usize>> = HashMap::new();
+    for (j, c) in converted {
+        match c {
+            Some(c) if other.contains(&j) => {
+                loaded.textures.push(c);
+                remap.insert(j, Some(loaded.textures.len() - 1));
+                copies += 1;
+            }
+            Some(c) => {
+                loaded.textures[j] = c;
+                in_place += 1;
+            }
+            None => {
+                remap.insert(j, None);
+                failed += 1;
+            }
+        }
+    }
+    for p in loaded.meshes.iter_mut().flat_map(|m| m.parts.iter_mut()) {
+        if let Some(j) = p.normal_map {
+            if let Some(r) = remap.get(&j) {
+                p.normal_map = *r;
+                if r.is_none() {
+                    p.tangents.clear();
+                }
+            }
+        }
+    }
+    log.line(format!(
+        "normal maps as BC5: {} converted in place, {} copies (texture also used otherwise), {} failed ({:.2} s)",
+        in_place,
+        copies,
+        failed,
+        t.elapsed().as_secs_f64()
+    ));
+}
+
+/// The red and green channels of a texture (all its mips) as BC5.
+fn to_bc5(t: &TextureData) -> Option<TextureData> {
+    let rgba = crate::ground::decode_all_mips(t)?;
+    let mut data = Vec::new();
+    let (mut w, mut h, mut offset) = (t.width as usize, t.height as usize, 0usize);
+    for _ in 0..t.mip_count {
+        let mip = rgba.get(offset..offset + w * h * 4)?;
+        for by in 0..h.div_ceil(4) {
+            for bx in 0..w.div_ceil(4) {
+                for channel in 0..2 {
+                    let mut v = [0u8; 16];
+                    for (k, value) in v.iter_mut().enumerate() {
+                        // Pixels past the edge repeat the last row or column.
+                        let (x, y) = ((bx * 4 + k % 4).min(w - 1), (by * 4 + k / 4).min(h - 1));
+                        *value = mip[(y * w + x) * 4 + channel];
+                    }
+                    data.extend_from_slice(&bc4_block(&v));
+                }
+            }
+        }
+        offset += w * h * 4;
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+    }
+    Some(TextureData {
+        name: format!("{} (BC5 red-green)", t.name),
+        format: BlockFormat::Bc5,
+        width: t.width,
+        height: t.height,
+        mip_count: t.mip_count,
+        data,
+        alpha: [0.0, 0.0, 1.0],
+        cutout: false,
+    })
+}
+
+/// One BC4 block (8 bytes) for 16 values: the largest and smallest value as
+/// end points, 6 steps between them, and a 3-bit index per value.
+fn bc4_block(v: &[u8; 16]) -> [u8; 8] {
+    let (lo, hi) = (*v.iter().min().expect("16 values"), *v.iter().max().expect("16 values"));
+    let mut out = [0u8; 8];
+    out[0] = hi;
+    out[1] = lo;
+    if hi == lo {
+        return out;
+    }
+    // Palette for end point 0 > end point 1: e0, e1, then 6 steps from e0 to e1.
+    let mut palette = [0i32; 8];
+    palette[0] = hi as i32;
+    palette[1] = lo as i32;
+    for i in 1..=6 {
+        palette[i + 1] = ((7 - i as i32) * hi as i32 + i as i32 * lo as i32) / 7;
+    }
+    let mut bits = 0u64;
+    for (k, &value) in v.iter().enumerate() {
+        let best = (0..8).min_by_key(|&i| (palette[i] - value as i32).abs()).expect("8 entries") as u64;
+        bits |= best << (3 * k);
+    }
+    out[2..8].copy_from_slice(&bits.to_le_bytes()[..6]);
+    out
+}
+
+/// Per-vertex tangents from the texture coordinates: the tangent follows +u
+/// (made perpendicular to the normal), w = 1 or -1 so that
+/// w * cross(normal, tangent) follows +v (as Bevy's mikktspace frame).
+pub fn tangents(positions: &[[f32; 3]], normals: &[[f32; 3]], uvs: &[[f32; 2]], indices: &[u32]) -> Vec<[f32; 4]> {
+    use bevy::math::Vec3;
+    let n = positions.len();
+    let (mut tu, mut tv) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
+    for tri in indices.chunks_exact(3) {
+        let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+        let (p0, p1, p2) = (Vec3::from(positions[a]), Vec3::from(positions[b]), Vec3::from(positions[c]));
+        let (e1, e2) = (p1 - p0, p2 - p0);
+        let (du1, dv1) = (uvs[b][0] - uvs[a][0], uvs[b][1] - uvs[a][1]);
+        let (du2, dv2) = (uvs[c][0] - uvs[a][0], uvs[c][1] - uvs[a][1]);
+        let r = du1 * dv2 - du2 * dv1;
+        if r.abs() < 1e-12 {
+            continue;
+        }
+        let along_u = (e1 * dv2 - e2 * dv1) / r;
+        let along_v = (e2 * du1 - e1 * du2) / r;
+        for i in [a, b, c] {
+            tu[i] += along_u;
+            tv[i] += along_v;
+        }
+    }
+    (0..n)
+        .map(|i| {
+            let nrm = Vec3::from(normals[i]).normalize_or_zero();
+            let mut t = (tu[i] - nrm * nrm.dot(tu[i])).normalize_or_zero();
+            if t == Vec3::ZERO {
+                // No usable texture direction: any direction across the normal.
+                t = nrm.any_orthonormal_vector();
+            }
+            let w = if nrm.cross(t).dot(tv[i]) < 0.0 { -1.0 } else { 1.0 };
+            [t.x, t.y, t.z, w]
+        })
+        .collect()
+}
+
+/// The foliage texture whose alpha is the smoothness: a texture parameter
+/// whose name says "Translucency" (`NormalTranslucencySmoothnessMap`), or one
+/// whose texture name ends `_NTS` or `_NNRS` (the vegetation `TexNormalmap`).
+/// Not `BaseColor_Smoothness` (the `_CS` colour texture of other objects:
+/// a later step).
+fn smoothness_texture(world: &World, mat: (usize, usize)) -> Option<(usize, usize)> {
+    let Some(Value::Struct(sh)) = world.get(mat).get("Shader") else { return None };
+    let Some(Value::Array { items, .. }) = sh.get("TextureParameters") else { return None };
+    items.iter().find_map(|tp| {
+        let Value::Struct(tp) = tp else { return None };
+        let Some(Value::Pointer(p)) = tp.get("Value") else { return None };
+        if matches!(p, Pointer::Null) {
+            return None;
+        }
+        let by_param = matches!(tp.get("ParameterName"), Some(Value::String(n)) if n.to_ascii_lowercase().contains("translucency"));
+        let name = world.link_name(mat.0, p).to_ascii_lowercase();
+        (by_param || name.ends_with("_nts") || name.ends_with("_nnrs")).then(|| world.resolve(mat.0, p)).flatten()
+    })
 }
 
 /// The shader a material (or material variation) names, if any.
@@ -158,11 +478,105 @@ pub struct LoadedMesh {
     pub hidden: Vec<String>,
     /// Sections only in the "transparent decal" category (for the log).
     pub decal_sections: usize,
+    /// Triangles left out because they belong to damage-state parts
+    /// (DESIGN.md "damaged parts hidden at the start").
+    pub damaged_triangles: usize,
+}
+
+/// Mesh parts that only damage states show (DESIGN.md "damaged parts hidden
+/// at the start"), per mesh asset. From every `...ModelEntityData` with a
+/// mesh and part components: the part numbers of each component's other
+/// health states, minus those of the start states (the most health). When
+/// two entities with the same mesh disagree, only the parts both hide.
+#[derive(Default)]
+pub struct HiddenParts {
+    pub by_mesh: HashMap<(usize, usize), std::collections::BTreeSet<u32>>,
+    /// Entities with part components, and meshes where two entities disagree.
+    pub entities: usize,
+    pub disagreements: usize,
+}
+
+fn hidden_parts(world: &World) -> HiddenParts {
+    use std::collections::BTreeSet;
+    let mut hp = HiddenParts::default();
+    for (pi, partition) in world.partitions.iter().enumerate() {
+        for inst in &partition.instances {
+            let v = &inst.value;
+            if !v.type_name.ends_with("ModelEntityData") {
+                continue;
+            }
+            let Some(Value::Pointer(mp)) = v.get("Mesh") else { continue };
+            let Some(mesh) = world.resolve(pi, mp) else { continue };
+            let Some(Value::Array { items, .. }) = v.get("Components") else { continue };
+            let (mut start, mut later) = (BTreeSet::new(), BTreeSet::new());
+            let mut any = false;
+            for c in items {
+                let Value::Pointer(cp) = c else { continue };
+                let Some(at) = world.resolve(pi, cp) else { continue };
+                let comp = world.get(at);
+                if comp.type_name != "PartComponentData" {
+                    continue;
+                }
+                let Some(Value::Array { items: states, .. }) = comp.get("HealthStates") else { continue };
+                // (health, mesh part) of each state; part None = nothing shown.
+                let list: Vec<(f64, Option<u32>)> = states
+                    .iter()
+                    .filter_map(|st| {
+                        let Value::Pointer(sp) = st else { return None };
+                        let st = world.get(world.resolve(at.0, sp)?);
+                        let health = match st.get("Health") {
+                            Some(Value::Float(h)) => *h,
+                            Some(Value::Int(h)) => *h as f64,
+                            Some(Value::UInt(h)) => *h as f64,
+                            _ => 0.0,
+                        };
+                        let part = match st.get("PartIndex") {
+                            Some(Value::UInt(p)) if *p < u64::from(u32::MAX) => Some(*p as u32),
+                            Some(Value::Int(p)) if (0..i64::from(u32::MAX)).contains(p) => Some(*p as u32),
+                            _ => None,
+                        };
+                        Some((health, part))
+                    })
+                    .collect();
+                // The start state: the most health (the first one on a tie).
+                let Some(first) = (0..list.len()).max_by(|&a, &b| list[a].0.total_cmp(&list[b].0).then(b.cmp(&a))) else { continue };
+                any = true;
+                for (k, (_, p)) in list.iter().enumerate() {
+                    if let Some(p) = p {
+                        if k == first {
+                            start.insert(*p);
+                        } else {
+                            later.insert(*p);
+                        }
+                    }
+                }
+            }
+            if !any {
+                continue;
+            }
+            hp.entities += 1;
+            let hide: BTreeSet<u32> = later.difference(&start).copied().collect();
+            match hp.by_mesh.get_mut(&mesh) {
+                Some(old) if *old != hide => {
+                    hp.disagreements += 1;
+                    *old = old.intersection(&hide).copied().collect();
+                }
+                Some(_) => {}
+                None => {
+                    hp.by_mesh.insert(mesh, hide);
+                }
+            }
+        }
+    }
+    hp.by_mesh.retain(|_, s| !s.is_empty());
+    hp
 }
 
 /// How a material is drawn.
 enum Look {
-    Texture(usize, Option<Tint>, Option<DetailSource>),
+    /// Colour texture, tint, detail texture, smoothness texture (foliage),
+    /// normal texture.
+    Texture(usize, Option<Tint>, Option<DetailSource>, Option<usize>, Option<usize>),
     Colour([f32; 3]),
     /// Colour from the terrain under the object.
     Terrain,
@@ -170,6 +584,8 @@ enum Look {
     Hide(&'static str),
     /// Drawn grey; the text says why (for the log).
     Missing(String),
+    /// See-through glass without a colour texture (DESIGN.md "window glass").
+    Glass(GlassLook),
 }
 
 pub struct TextureData {
@@ -265,8 +681,8 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
     log.line(format!("level walked: {} placed meshes ({:.2} s)", walker.meshes.len(), t.elapsed().as_secs_f64()));
 
     let t = Instant::now();
-    let terrain = load_terrain(&fs, &world)?;
-    log.line(format!("terrain loaded: {} height tiles ({:.2} s)", terrain.tiles.len(), t.elapsed().as_secs_f64()));
+    let (terrain, mask_note) = load_terrain(&fs, &world)?;
+    log.line(format!("terrain loaded: {} height tiles ({:.2} s); {mask_note}", terrain.tiles.len(), t.elapsed().as_secs_f64()));
 
     // Meshes and textures.
     let t = Instant::now();
@@ -297,9 +713,25 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
     // Object variations (DESIGN.md "decal variants").
     let variation_db = read_variation_db(&world);
     let variation_names = read_variation_names(&world);
+    // Damage-state mesh parts (DESIGN.md "damaged parts hidden at the start");
+    // BF1_DAMAGED_PARTS=show draws them as before.
+    let t_parts = Instant::now();
+    let show_damaged = std::env::var("BF1_DAMAGED_PARTS").is_ok_and(|v| v == "show");
+    let damaged = if show_damaged { HiddenParts::default() } else { hidden_parts(&world) };
+    log.line(format!(
+        "damaged parts: {} entities with part components, {} meshes hide damage-state parts ({} meshes where entities disagree; {:.2} s){}",
+        damaged.entities,
+        damaged.by_mesh.len(),
+        damaged.disagreements,
+        t_parts.elapsed().as_secs_f64(),
+        if show_damaged { " (off: BF1_DAMAGED_PARTS=show)" } else { "" }
+    ));
     // Placements per variant mesh: (count, index into loaded.meshes).
     let mut variant_counts: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
     let (mut variants_wanted, mut variants_unchanged, mut variants_switched_off) = (0usize, 0usize, 0usize);
+    let t_prefetch = Instant::now();
+    let prefetched = prefetch_textures(&fs, &world, &walker, opts, &variation_db, &folders);
+    log.line(format!("textures unpacked ahead on all cores: {prefetched} ({:.2} s)", t_prefetch.elapsed().as_secs_f64()));
 
     for placed in &walker.meshes {
         let Some(at) = placed.mesh_at else { continue };
@@ -330,7 +762,7 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
             Some(i) => *i,
             None => {
                 let overrides = variation_db.get(&(at, variant));
-                let i = match load_mesh(&fs, &world, at, opts, overrides, &mut loaded.textures, &mut texture_index, &mut stats, &folders, &mut guessed, &mut uv_stats) {
+                let i = match load_mesh(&fs, &world, at, opts, overrides, &mut loaded.textures, &mut texture_index, &mut stats, &folders, &mut guessed, &mut uv_stats, &damaged.by_mesh) {
                     Ok(mut m) => {
                         if variant != 0 {
                             m.name = format!("{} (variant {})", m.name, variation_names.get(&variant).cloned().unwrap_or_else(|| variant.to_string()));
@@ -391,6 +823,13 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
             }
         }
     }
+    let unused = PREFETCH.with(|p| std::mem::take(&mut *p.borrow_mut())).len();
+    log.line(format!("textures unpacked ahead but not used by the meshes: {unused}"));
+    log.line(format!(
+        "time in mesh geometry {:.2} s, in textures {:.2} s (read, unpack, check)",
+        GEOMETRY_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        TEXTURE_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+    ));
     log.line(format!("materials without a texture list, colour texture guessed from the folder: {guessed}"));
     log.line(uv_stats.summary());
     let mut flat: Vec<_> = uv_stats.flat_by_mesh.iter().filter(|(_, a)| **a > 0.0).collect();
@@ -403,6 +842,48 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
         log.line(format!("  uv debug: {d}"));
     }
     log.line(format!("placed parts: {placed_parts}, grey: {placed_grey}"));
+    // Damage-state triangles left out, per mesh and over all placements.
+    let mut damaged_by_mesh: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
+    for (i, _) in &loaded.placements {
+        let m = &loaded.meshes[*i];
+        if m.damaged_triangles > 0 {
+            let e = damaged_by_mesh.entry(m.name.rsplit('/').next().unwrap_or("").to_string()).or_insert((0, m.damaged_triangles));
+            e.0 += 1;
+        }
+    }
+    let mut top: Vec<_> = damaged_by_mesh.iter().collect();
+    top.sort_by(|a, b| (b.1 .0 * b.1 .1).cmp(&(a.1 .0 * a.1 .1)));
+    log.line(format!(
+        "damage-state triangles left out: {} meshes, {} placements, {} triangles in all placements; most: {}",
+        damaged_by_mesh.len(),
+        damaged_by_mesh.values().map(|v| v.0).sum::<usize>(),
+        damaged_by_mesh.values().map(|v| v.0 * v.1).sum::<usize>(),
+        top.iter().take(10).map(|(n, (c, t))| format!("{c} x {n} ({t})")).collect::<Vec<_>>().join(", ")
+    ));
+    // Terrain blend parts (DESIGN.md "terrain blend on mounds"): placements per
+    // mesh and the values they use.
+    let mut blend: std::collections::BTreeMap<String, (usize, String)> = std::collections::BTreeMap::new();
+    for (i, _) in &loaded.placements {
+        for p in &loaded.meshes[*i].parts {
+            if let Some(b) = p.terrain_blend {
+                let e = blend.entry(loaded.meshes[*i].name.rsplit('/').next().unwrap_or("").to_string()).or_default();
+                e.0 += 1;
+                e.1 = format!(
+                    "up mask {}, threshold {}, offset {}, up normals {}, texture mask {}, textured {}",
+                    b.up_mask,
+                    b.threshold,
+                    b.offset,
+                    b.up_normals,
+                    b.texture_mask,
+                    p.texture.is_some() && p.tint.is_none() && p.detail.is_none()
+                );
+            }
+        }
+    }
+    log.line(format!("terrain blend parts: {} placed in {} meshes", blend.values().map(|v| v.0).sum::<usize>(), blend.len()));
+    for (name, (n, values)) in &blend {
+        log.line(format!("  terrain blend {n:4} x {name}: {values}"));
+    }
     let mut top: Vec<_> = grey.into_iter().collect();
     top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     for (why, (n, meshes)) in top.iter().take(25) {
@@ -579,7 +1060,7 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
                 // The same mesh can serve several types: load it once.
                 let mesh = match loaded.meshes.iter().position(|m| m.name.eq_ignore_ascii_case(&world.names[part])) {
                     Some(i) => i,
-                    None => match load_mesh(&fs, &world, (part, 0), opts, None, &mut loaded.textures, &mut texture_index, &mut stats, &folders, &mut guessed, &mut uv_stats) {
+                    None => match load_mesh(&fs, &world, (part, 0), opts, None, &mut loaded.textures, &mut texture_index, &mut stats, &folders, &mut guessed, &mut uv_stats, &damaged.by_mesh) {
                         Ok(mut m) => {
                             // Shader-graph materials keep their textures in the
                             // shader: take the colour texture from the shader database.
@@ -643,7 +1124,9 @@ pub fn load_level(log: &GameLog, opts: &Options) -> Result<Loaded> {
         Err(e) => log.line(format!("terrain mesh scattering not read: {e:#}")),
     }
     log.line(format!("terrain mesh scattering: {} types ({:.2} s)", loaded.scatter.len(), t.elapsed().as_secs_f64()));
+    convert_normal_maps(&mut loaded, log);
     log_files_used(&fs, log);
+    SHADER_DB.with(|c| c.borrow_mut().take());
     Ok(loaded)
 }
 
@@ -705,11 +1188,27 @@ fn material_vector(world: &World, mat: (usize, usize), name: &str) -> Option<[f3
     })
 }
 
+thread_local! {
+    /// The level's shader database (159 MB on Verdun), read once while
+    /// loading and dropped at the end of `load_level` (faster start).
+    static SHADER_DB: std::cell::RefCell<Option<std::rc::Rc<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The level's shader database bytes (read on first use, then kept).
+fn shader_db(fs: &GameFs, world: &World, opts: &Options) -> Result<std::rc::Rc<Vec<u8>>> {
+    if let Some(db) = SHADER_DB.with(|c| c.borrow().clone()) {
+        return Ok(db);
+    }
+    let db = std::rc::Rc::new(world.read_res_named(fs, &format!("{}/shaderdb", opts.level))?);
+    SHADER_DB.with(|c| *c.borrow_mut() = Some(db.clone()));
+    Ok(db)
+}
+
 /// The colour texture that a shader-graph shader uses, from the level's
 /// shader database (texture names ending `_C`, `_C_Mip`, `_CA` or `_CS`).
 fn shader_colour_texture(fs: &GameFs, world: &World, opts: &Options, shader: &str) -> Option<(usize, usize)> {
     use fb_res::shaderdb::{fb_hash, ShaderDb};
-    let db = world.read_res_named(fs, &format!("{}/shaderdb", opts.level)).ok()?;
+    let db = shader_db(fs, world, opts).ok()?;
     let sdb = ShaderDb::parse(&db, fb_hash(&shader.to_lowercase())).ok()?;
     let mut names: Vec<String> = sdb.textures_of(shader)?.into_iter().collect();
     names.sort();
@@ -778,9 +1277,8 @@ fn load_ground_textures(
     textures: &mut Vec<TextureData>,
     log: &GameLog,
 ) -> Result<Vec<GroundTexture>> {
-    let db_name = format!("{}/shaderdb", opts.level);
     let t = Instant::now();
-    let db = world.read_res_named(fs, &db_name)?;
+    let db = shader_db(fs, world, opts)?;
     let mut names = terrain_texture_names(&db);
     log.line(format!(
         "shader database: {:.0} MB read in {:.2} s; terrain colour textures listed: {}",
@@ -809,6 +1307,19 @@ fn load_ground_textures(
             names.push(tex.clone());
         }
     }
+    // Unpack the colour and _NRH textures on all cores first (faster start);
+    // the loop below takes them from there.
+    let mut wanted = Vec::new();
+    for name in names.iter().chain(names.iter().filter_map(|n| normal_map.get(&n.to_ascii_lowercase()))) {
+        if let Some(part) = world.partition_by_name(name) {
+            if let Some(Value::ResourceRef(rid)) = world.get((part, 0)).get("Resource") {
+                if !wanted.iter().any(|(k, _)| *k == (*rid, opts.ground_mip_skip)) {
+                    wanted.push(((*rid, opts.ground_mip_skip), (part, 0)));
+                }
+            }
+        }
+    }
+    unpack_ahead(fs, world, &wanted);
     let mut out = Vec::new();
     // Own cache: the ground textures load at their own mip (full size by default).
     let mut ground_index = HashMap::new();
@@ -841,6 +1352,7 @@ fn load_ground_textures(
         });
         out.push(GroundTexture { name, texture: i, layers, nrh });
     }
+    PREFETCH.with(|p| p.borrow_mut().clear());
     Ok(out)
 }
 
@@ -995,7 +1507,8 @@ fn small_mip_sized(t: &TextureData, max_width: usize) -> Option<(usize, usize, V
     None
 }
 
-fn load_terrain(fs: &GameFs, world: &World) -> Result<fb_terrain::Terrain> {
+/// The terrain, and a line for the log about its layer masks.
+fn load_terrain(fs: &GameFs, world: &World) -> Result<(fb_terrain::Terrain, String)> {
     let part = (0..world.partitions.len())
         .find(|&i| world.partitions[i].primary().is_some_and(|p| p.value.type_name == "TerrainData"))
         .context("no TerrainData")?;
@@ -1003,12 +1516,16 @@ fn load_terrain(fs: &GameFs, world: &World) -> Result<fb_terrain::Terrain> {
         anyhow::bail!("TerrainData has no TerrainStreamingTreeResource")
     };
     let tree = world.read_res(fs, *rid)?;
-    let (terrain, _) = fb_terrain::Terrain::load(
+    let (terrain, stats) = fb_terrain::Terrain::load(
         &tree,
         |id| world.chunks.contains_key(id) || fs.toc_chunks.contains_key(id),
         |id| world.read_chunk(fs, id),
     )?;
-    Ok(terrain)
+    let note = format!(
+        "patches whose layers are not in ascending order: {}",
+        stats.masks.as_ref().map_or("?".to_string(), |m| m.patches_not_ascending.to_string())
+    );
+    Ok((terrain, note))
 }
 
 /// Material changes of the level's object variations (DESIGN.md "decal
@@ -1120,13 +1637,18 @@ fn load_mesh(
     folders: &TextureFolders,
     guessed: &mut usize,
     uv_stats: &mut UvStats,
+    // Damage-state parts to leave out (DESIGN.md "damaged parts hidden at the start").
+    hidden_parts: &HashMap<(usize, usize), std::collections::BTreeSet<u32>>,
 ) -> Result<LoadedMesh> {
     let asset = world.get(at);
+    let hide = hidden_parts.get(&at);
+    let t0 = Instant::now();
     let Some(Value::ResourceRef(rid)) = asset.get("MeshSetResource") else { anyhow::bail!("no MeshSetResource") };
     let ms = parse_meshset(&world.read_res(fs, *rid)?)?;
     let lod = ms.lods.first().context("no LODs")?;
     let chunk = lod.chunk_id.context("inline mesh data (not supported yet)")?;
     let g = decode_lod(lod, &world.read_chunk(fs, &chunk)?, stats)?;
+    add_time(&GEOMETRY_NANOS, t0);
 
     // Each material and the variant material that replaces it (if any).
     let sources: Vec<Option<((usize, usize), Option<(usize, usize)>)>> = match asset.get("Materials") {
@@ -1179,6 +1701,13 @@ fn load_mesh(
                         if let Some(c) = plain_colour(world, mat) {
                             return Look::Colour(c);
                         }
+                        // Glass names no texture: drawn see-through rather than with a
+                        // guessed texture (DESIGN.md "window glass"). BF1_GLASS=off: old way.
+                        if opts.glass {
+                            if let Some(g) = glass_look(world, mat, var) {
+                                return Look::Glass(g);
+                            }
+                        }
                         let Some(guess) = guess_colour_texture(world, folders, at, mat) else { return Look::Missing(material_summary(world, mat)) };
                         *guessed += 1;
                         guess
@@ -1197,7 +1726,20 @@ fn load_mesh(
                             let mask = if m == t { texture } else { load_texture(fs, world, m, opts.texture_mip_skip, textures, texture_index)? };
                             Some(DetailSource { texture, mask, swap_sets })
                         });
-                        Look::Texture(i, tint, detail)
+                        // Foliage: the normal / translucency / smoothness texture
+                        // (DESIGN.md "shiny leaves and wet ground").
+                        let smoothness = var
+                            .and_then(|v| smoothness_texture(world, v))
+                            .or_else(|| smoothness_texture(world, mat))
+                            .and_then(|t| load_texture(fs, world, t, opts.texture_mip_skip, textures, texture_index));
+                        // Normal map (DESIGN.md "normal maps on models"), only if
+                        // red and green hold a plain normal.
+                        let normal = var
+                            .and_then(|v| normal_texture(world, v))
+                            .or_else(|| normal_texture(world, mat))
+                            .and_then(|t| load_texture(fs, world, t, opts.texture_mip_skip, textures, texture_index))
+                            .filter(|&j| is_normal_map(&textures[j]));
+                        Look::Texture(i, tint, detail, smoothness, normal)
                     }
                     None => Look::Missing(format!("texture failed: {}", world.names[tex.0])),
                 }
@@ -1213,6 +1755,7 @@ fn load_mesh(
         });
     let mut parts = Vec::new();
     let mut hidden = Vec::new();
+    let mut damaged_triangles = 0usize;
     for s in &g.submeshes {
         if let Some(Look::Hide(why)) = looks.get(s.material_id as usize) {
             hidden.push(why.to_string());
@@ -1227,10 +1770,17 @@ fn load_mesh(
         }
         // Keep only the vertices this part uses.
         let mut remap: HashMap<u32, u32> = HashMap::new();
-        let mut part = Part { positions: vec![], normals: vec![], uvs: vec![], indices: vec![], texture: None, colour: None, missing: None, terrain_coloured: false, tint: None, detail: None, uvs1: vec![], material_id: s.material_id, decal: None };
+        let mut part = Part { positions: vec![], normals: vec![], uvs: vec![], indices: vec![], texture: None, colour: None, missing: None, terrain_coloured: false, tint: None, detail: None, uvs1: vec![], material_id: s.material_id, decal: None, smoothness: None, normal_map: None, tangents: vec![], terrain_blend: None, glass: None };
         // Second texture coordinate set of the part (0x22), if the mesh has one.
         let mut second: Vec<[f32; 2]> = Vec::new();
         for tri in g.indices[s.first_index..s.first_index + s.index_count].chunks(3) {
+            // Damage-state parts are not shown at the start of a round.
+            if let (Some(h), false) = (hide, g.parts.is_empty()) {
+                if tri.iter().any(|&v| h.contains(&u32::from(g.parts[v as usize]))) {
+                    damaged_triangles += 1;
+                    continue;
+                }
+            }
             // Stored winding: counter-clockwise faces the viewer, as in Bevy.
             for &old in tri {
                 let new = *remap.entry(old).or_insert_with(|| {
@@ -1250,9 +1800,14 @@ fn load_mesh(
                 part.indices.push(new);
             }
         }
+        // A part made only of damage-state pieces is left out.
+        if part.indices.is_empty() {
+            hidden.push("damage state part".to_string());
+            continue;
+        }
         // Collapsed texture coordinates (for the log), and the detail texture
         // on the second set (DESIGN.md "flat grey walls").
-        if let Some(Look::Texture(_, _, detail)) = looks.get(s.material_id as usize) {
+        if let Some(Look::Texture(_, _, detail, _, _)) = looks.get(s.material_id as usize) {
             let first = collapsed_share(&part.positions, &part.uvs, &part.indices);
             let area = surface_area(&part.positions, &part.indices);
             uv_stats.parts += 1;
@@ -1290,6 +1845,10 @@ fn load_mesh(
                 *uv_stats.flat_by_mesh.entry(format!("{} material {}", world.names[at.0].rsplit('/').next().unwrap_or(""), s.material_id)).or_default() += flat;
             }
         }
+        // Terrain blend (DESIGN.md "terrain blend on mounds").
+        if let Some(Some((mat, var))) = sources.get(s.material_id as usize) {
+            part.terrain_blend = terrain_blend(world, *mat, *var);
+        }
         // Decal parts: how to blend (from the variant material if any).
         if s.decal {
             part.decal = Some(match sources.get(s.material_id as usize) {
@@ -1298,13 +1857,20 @@ fn load_mesh(
             });
         }
         match looks.get(s.material_id as usize) {
-            Some(Look::Texture(i, tint, _)) => {
+            Some(Look::Texture(i, tint, _, smoothness, normal)) => {
                 part.texture = Some(*i);
                 part.tint = *tint;
+                part.smoothness = *smoothness;
+                // Tangents need normals and texture coordinates for every vertex.
+                if let Some(n) = normal.filter(|_| part.normals.len() == part.positions.len() && part.uvs.len() == part.positions.len()) {
+                    part.tangents = tangents(&part.positions, &part.normals, &part.uvs, &part.indices);
+                    part.normal_map = Some(n);
+                }
             }
             Some(Look::Colour(c)) => part.colour = Some(*c),
             Some(Look::Terrain) => part.terrain_coloured = true,
             Some(Look::Missing(why)) => part.missing = Some(if s.transparent { format!("{why} [transparent]") } else { why.clone() }),
+            Some(Look::Glass(g)) => part.glass = Some(*g),
             Some(Look::Hide(_)) => unreachable!("hidden parts are skipped above"),
             None => part.missing = Some(format!("material id {} out of {}", s.material_id, looks.len())),
         }
@@ -1314,7 +1880,7 @@ fn load_mesh(
         .iter()
         .filter(|s| !lod.categories[fb_res::mesh::category::OPAQUE].contains(s) && !lod.categories[fb_res::mesh::category::TRANSPARENT].contains(s))
         .count();
-    Ok(LoadedMesh { name: world.names[at.0].clone(), parts, hidden, decal_sections })
+    Ok(LoadedMesh { name: world.names[at.0].clone(), parts, hidden, decal_sections, damaged_triangles })
 }
 
 /// The colour texture of a material: from its own texture parameters, else
@@ -1356,6 +1922,15 @@ fn colour_from_shader_struct(world: &World, part: usize, sh: &fb_ebx::Complex, d
     colour_from_shader_struct(world, target.0, inner, depth - 1)
 }
 
+/// Time spent reading and decoding mesh geometry and textures (for the
+/// start-up log, DESIGN.md "faster start"), in nanoseconds.
+static GEOMETRY_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TEXTURE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn add_time(counter: &std::sync::atomic::AtomicU64, since: Instant) {
+    counter.fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn load_texture(
     fs: &GameFs,
     world: &World,
@@ -1368,7 +1943,25 @@ fn load_texture(
     if let Some(i) = texture_index.get(rid) {
         return *i;
     }
-    let result = (|| -> Result<TextureData> {
+    let t0 = Instant::now();
+    let prefetched = PREFETCH.with(|p| p.borrow_mut().remove(&(*rid, mip_skip)));
+    let result = prefetched.unwrap_or_else(|| decode_texture(fs, world, tex, mip_skip));
+    add_time(&TEXTURE_NANOS, t0);
+    let index = match result {
+        Ok(t) => {
+            textures.push(t);
+            Some(textures.len() - 1)
+        }
+        Err(_) => None,
+    };
+    texture_index.insert(*rid, index);
+    index
+}
+
+/// Read, unpack and check one texture (all mips from `mip_skip` on).
+fn decode_texture(fs: &GameFs, world: &World, tex: (usize, usize), mip_skip: usize) -> Result<TextureData> {
+    let Some(Value::ResourceRef(rid)) = world.get(tex).get("Resource") else { anyhow::bail!("texture without a resource") };
+    {
         let h = parse_texture(&world.read_res(fs, *rid)?)?;
         let format = block_format(h.pixel_format).with_context(|| format!("pixel format {}", h.pixel_format))?;
         let data = world.read_chunk(fs, &h.chunk_id)?;
@@ -1395,16 +1988,80 @@ fn load_texture(
         t.alpha = alpha_shares(&t);
         t.cutout = is_cutout(t.alpha);
         Ok(t)
-    })();
-    let index = match result {
-        Ok(t) => {
-            textures.push(t);
-            Some(textures.len() - 1)
+    }
+}
+
+thread_local! {
+    /// Textures unpacked ahead on all cores (`prefetch_textures`), by
+    /// (resource id, mips skipped). `load_texture` takes them from here and
+    /// unpacks anything else itself, so the result is the same either way.
+    static PREFETCH: std::cell::RefCell<HashMap<(u64, usize), Result<TextureData>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Unpack on all cores the textures the mesh loading will most likely ask
+/// for (DESIGN.md "faster start"): per used mesh and material (and its
+/// variant), the colour texture (or the folder guess), the paint mask and the
+/// detail textures. Returns how many were unpacked.
+fn prefetch_textures(fs: &GameFs, world: &World, walker: &Walker, opts: &Options, variation_db: &VariationDb, folders: &TextureFolders) -> usize {
+    let mut seen_mesh = std::collections::HashSet::new();
+    let mut wanted: Vec<((u64, usize), (usize, usize))> = Vec::new();
+    let mut seen_tex = std::collections::HashSet::new();
+    let mut want = |tex: (usize, usize), skip: usize, wanted: &mut Vec<((u64, usize), (usize, usize))>| {
+        if let Some(Value::ResourceRef(rid)) = world.get(tex).get("Resource") {
+            if seen_tex.insert((*rid, skip)) {
+                wanted.push(((*rid, skip), tex));
+            }
         }
-        Err(_) => None,
     };
-    texture_index.insert(*rid, index);
-    index
+    for placed in &walker.meshes {
+        let Some(at) = placed.mesh_at else { continue };
+        if is_helper_mesh(&placed.mesh) || !seen_mesh.insert((at, placed.variation)) {
+            continue;
+        }
+        let overrides = variation_db.get(&(at, placed.variation)).filter(|_| variation_applies(&opts.variations, &placed.mesh));
+        let Some(Value::Array { items, .. }) = world.get(at).get("Materials") else { continue };
+        for m in items {
+            let Value::Pointer(p) = m else { continue };
+            let Some(mat) = world.resolve(at.0, p) else { continue };
+            let var = overrides.and_then(|o| o.get(&mat)).copied();
+            let colour = var.and_then(|v| base_color_texture(world, v)).or_else(|| base_color_texture(world, mat)).or_else(|| guess_colour_texture(world, folders, at, mat));
+            if let Some(t) = colour {
+                want(t, opts.texture_mip_skip, &mut wanted);
+            }
+            for from in [Some(mat), var].into_iter().flatten() {
+                if let Some(t) = texture_parameter(world, from, "Masks") {
+                    want(t, 0, &mut wanted);
+                }
+            }
+            if let Some((t, mask, _)) = material_detail(world, mat) {
+                want(t, opts.texture_mip_skip, &mut wanted);
+                want(mask, opts.texture_mip_skip, &mut wanted);
+            }
+            if let Some(t) = var.and_then(|v| smoothness_texture(world, v)).or_else(|| smoothness_texture(world, mat)) {
+                want(t, opts.texture_mip_skip, &mut wanted);
+            }
+            if let Some(t) = var.and_then(|v| normal_texture(world, v)).or_else(|| normal_texture(world, mat)) {
+                want(t, opts.texture_mip_skip, &mut wanted);
+            }
+        }
+    }
+    unpack_ahead(fs, world, &wanted)
+}
+
+/// Unpack these textures ((resource id, mips skipped), texture asset) on all
+/// cores into `PREFETCH`. Returns how many.
+fn unpack_ahead(fs: &GameFs, world: &World, wanted: &[((u64, usize), (usize, usize))]) -> usize {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32);
+    let done: Vec<((u64, usize), Result<TextureData>)> = std::thread::scope(|sc| {
+        let jobs: Vec<_> = wanted
+            .chunks(wanted.len().div_ceil(threads).max(1))
+            .map(|part| sc.spawn(move || part.iter().map(|&(key, tex)| (key, decode_texture(fs, world, tex, key.1))).collect::<Vec<_>>()))
+            .collect();
+        jobs.into_iter().flat_map(|j| j.join().unwrap_or_default()).collect()
+    });
+    let n = done.len();
+    PREFETCH.with(|p| p.borrow_mut().extend(done));
+    n
 }
 
 /// Shader name and texture parameter names of a material, for the log.
@@ -1825,7 +2482,48 @@ fn is_helper_mesh(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cutout, tint_base_colour, Tint};
+    use super::{bc4_block, is_cutout, tangents, tint_base_colour, Tint};
+
+    #[test]
+    fn bc4_blocks_decode_back_close() {
+        // A ramp and a flat block, decoded with the same decoder the game uses.
+        let mut ramp = [0u8; 16];
+        for (k, v) in ramp.iter_mut().enumerate() {
+            *v = (k * 16) as u8;
+        }
+        for v in [ramp, [77u8; 16]] {
+            let block = bc4_block(&v);
+            // BC5 = red block + green block; decode and compare the red channel.
+            let mut both = block.to_vec();
+            both.extend_from_slice(&block);
+            let mut px = vec![0u32; 16];
+            texture2ddecoder::decode_bc5(&both, 4, 4, &mut px).unwrap();
+            // At most half a step of the 8-value palette off.
+            let half_step = (*v.iter().max().unwrap() as i32 - *v.iter().min().unwrap() as i32) / 14 + 1;
+            for (k, p) in px.iter().enumerate() {
+                let red = p.to_le_bytes()[2] as i32;
+                assert!((red - v[k] as i32).abs() <= half_step, "texel {k}: {red} against {}", v[k]);
+            }
+        }
+    }
+
+    #[test]
+    fn tangents_follow_u_and_the_sign_follows_v() {
+        // A flat square, normal +y, texture u along +x and v along +z: the
+        // tangent is +x and w * cross(normal, tangent) must point to +z.
+        let positions = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]];
+        let normals = [[0.0, 1.0, 0.0]; 4];
+        let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let t = tangents(&positions, &normals, &uvs, &[0, 2, 1, 0, 3, 2]);
+        for v in &t {
+            assert!((v[0] - 1.0).abs() < 1e-5 && v[1].abs() < 1e-5 && v[2].abs() < 1e-5, "{v:?}");
+            // cross(+y, +x) = -z, so w must be -1 for +z.
+            assert_eq!(v[3], -1.0);
+        }
+        // v running the other way flips the sign.
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        assert!(tangents(&positions, &normals, &uvs, &[0, 2, 1, 0, 3, 2]).iter().all(|v| v[3] == 1.0));
+    }
 
     #[test]
     fn collapsed_share_finds_point_mapped_faces() {

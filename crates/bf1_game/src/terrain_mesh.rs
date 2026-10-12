@@ -34,18 +34,65 @@ pub struct BuildStats {
     pub max_skirt_depth: f32,
 }
 
+impl BuildStats {
+    /// Add the counts of a later part (parts added in order keep the first
+    /// largest gap, as building one patch after another did).
+    fn merge(&mut self, o: BuildStats) {
+        self.patches_with_holes += o.patches_with_holes;
+        self.triangles_left_out += o.triangles_left_out;
+        self.seam_edges += o.seam_edges;
+        if o.max_gap > self.max_gap {
+            self.max_gap = o.max_gap;
+            self.max_gap_at = o.max_gap_at;
+        }
+        self.skirt_triangles += o.skirt_triangles;
+        self.max_skirt_depth = self.max_skirt_depth.max(o.max_skirt_depth);
+    }
+}
+
+/// Run `f` on rows 0..rows on all cores; returns each row's results in row
+/// order, with the statistics merged in row order (faster start).
+fn par_rows<T: Send>(rows: usize, f: impl Fn(usize, &mut BuildStats) -> Vec<T> + Sync) -> (Vec<T>, BuildStats) {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32);
+    let per = rows.div_ceil(threads).max(1);
+    let parts: Vec<(Vec<T>, BuildStats)> = std::thread::scope(|sc| {
+        let f = &f;
+        let jobs: Vec<_> = (0..rows)
+            .step_by(per)
+            .map(|start| {
+                sc.spawn(move || {
+                    let mut st = BuildStats::default();
+                    let mut out = Vec::new();
+                    for r in start..(start + per).min(rows) {
+                        out.extend(f(r, &mut st));
+                    }
+                    (out, st)
+                })
+            })
+            .collect();
+        jobs.into_iter().map(|j| j.join().expect("terrain worker thread")).collect()
+    });
+    let mut stats = BuildStats::default();
+    let mut out = Vec::new();
+    for (o, st) in parts {
+        out.extend(o);
+        stats.merge(st);
+    }
+    (out, stats)
+}
+
 /// Skirts reach this far below the measured gap.
 const SKIRT_MARGIN: f32 = 0.25;
 
 /// Patches covering the whole terrain. `centre` is in Frostbite x, z.
 pub fn build(terrain: &Terrain, centre: [f32; 2], inner_half: f32, patch: f32, fine: f32, coarse: f32) -> (Vec<PatchData>, BuildStats) {
-    let mut stats = BuildStats::default();
     let nx = ((terrain.max[0] - terrain.min[0]) / patch - 0.01).ceil() as usize;
     let nz = ((terrain.max[2] - terrain.min[2]) / patch - 0.01).ceil() as usize;
     let corner = |ix: usize, iz: usize| (terrain.min[0] + ix as f32 * patch, terrain.min[2] + iz as f32 * patch);
-    // First the grid spacing of every patch, so each patch knows its neighbours.
-    let mut spacing = vec![0f32; nx * nz];
-    for iz in 0..nz {
+    // First the grid spacing of every patch, so each patch knows its neighbours
+    // (rows on all cores, in row order).
+    let (spacing, mut stats) = par_rows(nz, |iz, stats| {
+        let mut row = vec![0f32; nx];
         for ix in 0..nx {
             let (px, pz) = corner(ix, iz);
             let near = (px + patch > centre[0] - inner_half)
@@ -60,20 +107,24 @@ pub fn build(terrain: &Terrain, centre: [f32; 2], inner_half: f32, patch: f32, f
             if has_hole {
                 stats.patches_with_holes += 1;
             }
-            spacing[iz * nx + ix] = if has_hole { 0.5 } else if near { fine } else { coarse };
+            row[ix] = if has_hole { 0.5 } else if near { fine } else { coarse };
         }
-    }
-    let mut out = Vec::new();
-    for iz in 0..nz {
+        row
+    });
+    // Then the patches (rows on all cores, in row order).
+    let (out, patch_stats) = par_rows(nz, |iz, stats| {
+        let mut row = Vec::with_capacity(nx);
         for ix in 0..nx {
             let (px, pz) = corner(ix, iz);
             let at = |x: isize, z: isize| (x >= 0 && z >= 0 && (x as usize) < nx && (z as usize) < nz).then(|| spacing[z as usize * nx + x as usize]);
             let (x, z) = (ix as isize, iz as isize);
             // Neighbour spacing per edge: z = pz, z = pz + patch, x = px, x = px + patch.
             let neighbours = [at(x, z - 1), at(x, z + 1), at(x - 1, z), at(x + 1, z)];
-            out.push(build_patch(terrain, px, pz, patch, spacing[iz * nx + ix], neighbours, &mut stats));
+            row.push(build_patch(terrain, px, pz, patch, spacing[iz * nx + ix], neighbours, stats));
         }
-    }
+        row
+    });
+    stats.merge(patch_stats);
     (out, stats)
 }
 

@@ -2,6 +2,627 @@
 
 Newest entry at the top. One entry per change.
 
+## 2026-10-11: Damage-state parts hidden at the start (windows looked broken)
+
+**Request (user):** with see-through glass the windows look broken; at the
+start of a match they are whole (real-game screenshot 75).
+
+**Found (tested by Claude):** `housefarmwindow_01_b_mesh` is a
+`CompositeMeshAsset`; each vertex carries a mesh part number in its blend
+indices (usage 0x02, first byte; new probe command `bf1_probe mesh-dump`).
+The glass section has part 1 (16 triangles, the 4 whole panes, 76% of the
+window area), part 2 (316 triangles) and part 4 (158 triangles): shards. A
+coverage plot of the glass in the window plane showed a star-shaped area
+with 3+ layers in each pane. The window's `StaticModelEntityData` has 3
+`PartComponentData` with `HealthStates` (`Health`, `PartIndex`): (100: part
+0), (100: part 1; 90: part 2; 0: none), (90: part 3; 5: part 4; 0: none).
+
+**Changed:**
+- `fb_res::mesh`: `Geometry::parts` (the part number per vertex; `NO_PART`
+  for sections without blend indices).
+- `load.rs`: `hidden_parts`: for every `...ModelEntityData` with a mesh and
+  part components, the parts of the health states other than the start
+  state (the most health), minus the start states' parts, per mesh asset
+  (where entities disagree, only the parts both hide). `load_mesh` leaves out
+  triangles with a vertex in a hidden part; a part with no triangles left is
+  left out ("damage state part"). `BF1_DAMAGED_PARTS=show` for the old way.
+
+**Measured (tested by Claude, game closed):**
+- 553 entities with part components; 86 meshes hide damage-state parts; 0
+  disagreements. 903 placements of 85 meshes lose 1,620,065 triangles in
+  all (28.2 to 26.6 million drawn); 117 placed parts are left out whole.
+  Most: trench wall planks (124 placements x 2,015 triangles), hay bales
+  (22 x 5,144), trench parapets (36 x 2,777), trench stairs (22 x 4,540),
+  bunker doorways (13 x 4,825), generator control panels (4 x 15,271),
+  barbed wire (66 x 808).
+- The user's window view: the glass rays still hit `housefarmwindow_01_b`
+  part 1 (54%), mean colour [23, 35, 49].
+- Light probe fingerprint changed (2b3b801088956a63 to e97a7bdae241d045):
+  new bake, saved. Mesh entities 11,211 to 11,116; terrain-coloured copies
+  403 to 381. Frame rate at the user's spot 105 to 112 fps, graphics card
+  2.22 ms (before about 105 to 107, 2.26 ms). Tests pass (25 game, 5 mesh).
+
+**Confirmed by the user (2026-10-11):** "this fixed a lot of strange things
+that were already destroyed in the map that clearly weren't supposed to be".
+
+**Not checked:** whether some objects in the real game start damaged on
+purpose (the 29 `PredestructionEntityData`, MODLOG "missing meshes").
+
+## 2026-10-11: Window glass drawn see-through (was bright blue)
+
+**Request (user):** the windows in the rural area do not show properly; all
+the glass parts are bright blue (screenshot at `-153.3,62.3,4.1,31,1`).
+
+**Found (tested by Claude):** the glass materials name no texture (shaders
+`SS_HouseFarmGlass_01` 105 placements, `SS_HouseFarmGlassNoDistortion_01`
+70, `SS_LampWallResidentialGlass_01` 40, `SS_StreetLampGlass_02` 16). Our
+loader then guessed a texture by name from the folder:
+`T_HouseFarmGlass_C`, which is linear data (BC7, not sRGB) with mask-like
+channels (mean red 0.10, green 0.06, blue 0.28; probably dirt), drawn as
+colour. The farm glass material gives `BaseColor` 0.34 grey, `Opacity` 0.5,
+`Smoothness` 200 and `CastShadow` false.
+
+**Changed:**
+- `load.rs`: a material without a colour texture whose shader name contains
+  "glass" gets `Part::glass` (`GlassLook`: `BaseColor` and `Opacity`, the
+  variant's values first; 0.34 grey and 0.5 when the material gives none)
+  instead of a guessed texture. `Options::glass`; `BF1_GLASS=off` for the
+  old way.
+- `main.rs`: glass parts use a blended StandardMaterial (roughness 0.1, both
+  sides) and cast no shadow. Collision and light probes are not changed (the
+  probe fingerprint stays 2b3b801088956a63).
+
+**Measured (tested by Claude, the user's window view, view probe):** glass
+rays mean colour [5, 13, 57] before, [24, 35, 49] after; 2 glass materials
+for 20 mesh parts; textures guessed from the folder 107 before, 78 after. No
+shader errors. 25 game tests pass.
+
+**Not checked:** the look against the real game (the user); the dirt mask
+(`T_HouseFarmGlass_C`, channel meaning not known); whether some of the 78
+other guessed textures are also not colour textures.
+
+## 2026-10-11: Terrain blend on mounds, steps 1 and 2
+
+**Request (user):** the dirt mounds are the more pressing issue (the
+footprints can wait until the end).
+
+**Changed:**
+- `load.rs`: `Part::terrain_blend` (`TerrainBlend`: up mask flag,
+  threshold, offset, two more flags) from the material, variant values
+  first, when the shader name contains "terrainblend". Log lines "terrain
+  blend parts" and one per mesh with its values.
+- New material `terrain_blend.rs` / `terrain_blend.wgsl`: StandardMaterial
+  (the part's texture and BC5 normal map) plus the terrain's ground
+  textures and weight atlases (the same images, no new memory). Faces whose
+  normal (after the normal map) has an up component above the threshold
+  take the ground layers at the same x, z: mask = smoothstep(threshold -
+  0.1, threshold + 0.1, up) (the 0.1 is a guess), faded out with distance
+  like the terrain detail (150 to 450 m); colour, roughness and normal as on
+  the terrain. Only parts with `UpNormalMaskEnable` true, a texture, and no
+  tint or detail texture. `BF1_TERRAIN_BLEND=off` for the old look.
+
+**Measured (tested by Claude):**
+- Values per mesh (895 placements in 15 meshes): the up mask is set on 6
+  meshes, 619 placements: `wf_earthmoundlarge_01` (438; threshold 0.6,
+  offset 100), `wf_wallembeddedstone_01` (85; 0.8, 1), `wf_ridge_01` (37;
+  0.6, 0), `wf_dirtpile_02` (27; 0.5, 0.5), `wf_earthmoundlong_01` (20;
+  0.25, 1), `wf_dirtpile_01` (12; 1, 1). Not blended (no up mask; texture
+  mask or none): roots (164), embedded stones (65), tree stumps (24), small
+  mounds (16), trench floor log (7).
+- 6 terrain blend materials (one per mesh). The mound's own two colour
+  textures (base and Verdun variant) are plain fine mud: the leaves and moss
+  of the real mound must come from elsewhere, which fits this reading.
+- The user's mound view (`-259.3,61.9,11.9,-223,-11`, view probe, 132 rays
+  on the mound): mean colour [58, 57, 58] off, [71, 68, 63] on; bright
+  quarter [79, 74, 69] off, [107, 97, 80] on. The terrain rays did not
+  change. No shader errors.
+- Frame rate at the user's spot: 107 fps, graphics card 2.26 ms (as before).
+  25 game tests pass.
+
+**Not checked:** the look against the real game (the user); the meaning of
+`UpNormalMaskOffset`; the blend of the 9 meshes without the up mask.
+
+## 2026-10-11: Footprints still not explained (STATUS update 10); terrain blend on mounds; layers 11 and 18
+
+**Request (user):** real-game screenshots 68 to 73: "a lot more footprints
+all over the area"; and "the dirt mounds in the rewrite also seem very off"
+(real game against rewrite at `-259.3,61.9,11.9,-223,-11`).
+
+**Changed (probe tool only, the game is unchanged):**
+- `bf1_probe layer-combos <superbundle> [--swap a,b] [--dump <file>]`:
+  patch layer sets against the terrain shader-name layer sets.
+- `bf1_probe layer-colours <superbundle> <texture>...`: colour-map colour
+  where each layer is dominant, and texture mean colours.
+
+**Found (tested by Claude):**
+- Footprints: layer 9's own mask covers 3% of the battle area, 2% after the
+  blend; the mud pile, variation and side-flow textures have no footprints;
+  the masks are complete (77 nodes, 0 mismatches). Not explained: written up
+  in STATUS.md update 10 (third attempt; AGENTS.md rule).
+- Record layers 11 and 18 are probably exchanged: exact shader-set matches
+  12 of 848 coarse patches as now, 770 with the exchange; the colour map
+  where layer 11 is dominant fits `MudPile_05`, not `GrassBigTile`. Layer
+  11 is mostly outside the playable area. Not applied yet.
+- The mound in the user's view is the mesh `wf_earthmoundlarge_01_mesh`
+  (view probe: 91% of the rays in the mound region), the most placed mesh
+  (438). Its shader is `ObjectPreset_CS+N_TerrainBlend` with
+  `UpNormalMaskEnable` true, `UpNormalMaskThreshold` 0.6,
+  `UpNormalMaskOffset` 100 (base mesh also `ForceTerrainRain` true). All 438
+  placements carry the variant `WF_EarthMoundLarge_01_Verdun` (same shader,
+  the Xpack1 colour texture), which we leave out by default. We draw only
+  the mesh's own texture; we think the game draws the ground layers on the
+  faces that point up (not confirmed). 15 placed meshes, 895 placements use
+  this shader: earth mounds, dirt piles, ridges, roots, tree stumps,
+  embedded stones and walls, a trench floor log.
+
+**Not checked:** the exact rule of the terrain blend (compiled shader).
+
+## 2026-10-11: Variation and side-flow textures (read only); footprints 6 m east
+
+**Request (user):** "yes start that": look at the terrain variation texture.
+
+**Changed (probe tool only):**
+- New command `bf1_probe texture-png <superbundle> <texture> [width]`: saves
+  a texture mip as PNG (colour and one grey picture per channel) to
+  `extracted/export` (git ignores it), and logs per channel the spread and
+  the patch size (shift where the autocorrelation falls under 0.5).
+- `terrain-shader-textures ... --detail <n>`: the letters after each layer
+  number in the shader names, and the full slot list of the first n shaders.
+
+**Found (tested by Claude):**
+- `T_Variation_03_RGB`: 2048 x 2048, BC1, 3 independent channels (correlation
+  0.02 or less), alpha always 1. Red: diagonal streaks, patches about 27 x 15
+  texels of 512; green and blue: soft blobs about 50 and 70 texels of 512.
+  Very smooth (mean step 0.006 to 0.011 per texel). No footprint shapes. It
+  is in every terrain shader at the slot right after the first layer's two
+  textures, so it is probably shared by all layers (not confirmed).
+- Every layer in every shader name has the letters "MV" (meaning unknown;
+  they do not single out a layer).
+- `T_Gen_Side_Flows_01_NRH`: a normal map of small water channels running
+  down a slope (red, green = normal, alpha = height, blue against alpha
+  -0.65). In the 6 shaders listed it follows the mud pile layer 0 (STATUS
+  update 8: it goes with layers 0, 1, 8 and 9). No footprints.
+- Footprint mud near the mud pile: within 10 m 19% (sharp edges: 19% of the
+  points over 0.5), as a strip at x -256 to -250, z -2 to 18, about 6 m east
+  of the inspected point (-261.9, 10.2). The user's camera (yaw 81) looked
+  west, so the strip was behind it.
+
+**Not checked:** whether the real game has footprints at the inspected
+point (then our mask positions are a few metres off) or in the strip; how
+the game's shader uses the variation and side-flow textures (the code is
+compiled; any use by us would be a guess).
+
+## 2026-10-11: Footprints at the mud pile: data check; larger repeat size rejected
+
+**Request (user):** the mud pile at (-261.9, 10.2) looked different in the
+real game (screenshot 58 against 59); the user remembers footprints there,
+like our footprint layer at (-75.6, -82.1).
+
+**Measured (tested by Claude, `bf1_probe layer-grid`, read only):**
+- Mud pile: layer 0 (`T_Gen_MudPile_02_CS`) 72%, layers 6 and 7 (forest
+  floors) 28%. Layer 9 (footprints) is in no patch there, at any level.
+- Footprint spot: layer 9 28%, layer 0 29%, others.
+- The footprint layer covers 1% of the battle area in our reading.
+- All 185 terrain shaders also use `T_Variation_03_RGB` (slots 6 to 10),
+  which we do not use.
+- No placed mesh or decal has "foot" in its name.
+
+**Failed (tested by the user):** texture repeat 12 m instead of 6 m
+(`BF1_GROUND_TILE=12`): "way too big, the previous size was fine". The
+repeat size stays 6 m, so it is probably not the cause.
+
+**Still open (not checked):** the variation texture; our mask reading at
+that place (95.8% agreement in general).
+
+## 2026-10-10: Fewer draw objects, step 0: frame rate against the number of objects
+
+**Request (user):** explain option 3 (merging static scenery), then "yes" to
+the small test first.
+
+**Changed:** new test switch `BF1_DRAW_SHARE=<percent>` draws only that share
+of the placements (picked by a hash of the placement number, so the kept
+ones spread over the map). New log lines "merge estimate": how many entities
+a merge by material and map square would make, and how much mesh data it
+would copy. Nothing changes without the switch.
+
+**Measured (tested by Claude, game closed, the user's spot
+`-281.4,62.8,37.7,190,-5`, last 4 samples of 28 s runs):**
+
+| share | placements | mesh entities | fps | graphics card ms |
+|---|---|---|---|---|
+| 100% | 8,481 | 11,211 | 103 to 106 (one 62: window behind others) | 2.26 |
+| 75% | 6,360 | 8,391 | 111 to 122 | 2.27 |
+| 50% | 4,243 | 5,610 | 130 to 136 | 2.24 |
+| 25% | 2,123 | 2,798 | 141 to 144 | 2.28 |
+| 0% | 0 | 0 | 177 to 182 | 2.11 |
+| 100% again | 8,481 | 11,211 | 97 to 114 | 2.29 |
+
+Frame time: about 9.5 ms at 100%, 7.0 ms at 25%, 5.5 ms at 0%. About 0.3 ms
+per 1,000 entities between 25% and 100%; the last 25% costs more (1.5 ms),
+probably a fixed cost per material kind that a merge keeps (not checked).
+The graphics card time stays at about 2.2 ms: the triangles are not the
+limit.
+
+**Merge estimate (from the log, not built):** 10,815 parts (no decals) in
+279 materials; mesh data now 92 MB. Entities after a merge by material and
+map square: 32 m 2,777; 64 m 1,634; 128 m 1,023; 256 m 666. Merging
+everything copies 1,406 MB (each placement gets its own copy); most of it
+is earth mounds 189 MB (438 parts), bare ash trees 80 MB, destroyed trees
+102 MB, wooden barrels 36 MB (82 parts), crates 32 MB. Only small meshes
+merged (64 m squares), larger ones kept as now: up to 16 KB 8,843 entities
+(+18 MB); up to 64 KB 6,478 (+112 MB); up to 256 KB 3,380 (+612 MB); all
+1,635 (+1,404 MB).
+
+**Conclusion:** merging helps, but less than the 0% figure suggests. From
+the curve (estimate, not measured): 64 KB rule about 125 fps, 256 KB rule
+about 140, everything about 150, against about 105 now. The memory cost
+grows fast. Waits for the user's choice.
+
+## 2026-10-10: Frame rate drop to about 90: found and partly fixed (normal maps as BC5)
+
+**Request (user):** something drops the frame rate to about 60.
+
+**Measured (tested by Claude, game closed; `BF1_PROFILE=on`, new test
+switch `BF1_AUTOFLY=<m/s>` flies the camera straight ahead):**
+- The user's log: 57 to 91 fps while flying to the wall (earlier reading
+  207 standing, before the wide field of view and the normal maps).
+- At the user's spot (`-281.4,62.8,37.7,190,-5`): now about 91 fps; normal
+  maps off about 110; old 45-degree field of view about 135; scatter off
+  about 100; no backdrop cards 91; scatter casting no shadows (new switch
+  `BF1_SCATTER_SHADOWS=off`) about 97; 2 shadow cascades instead of 4 (new
+  switch `BF1_SHADOW_CASCADES=<n>`) about 120. Flying at 20 m/s: 78 to 140.
+- The graphics card needs only 2 to 3 ms per frame: the processor is the
+  limit (about 11 ms per frame).
+- Bevy trace (`bevy/trace_chrome`, a separate build in `target/trace`; 8 s
+  standing, 73 fps with tracing): render thread 11.8 ms per frame, of it
+  instance data for the shadow views 1.85 ms, bind groups for the GPU
+  culling step 1.46 ms (grows with the number of materials), command
+  submission 1.18 ms, unpacking draw lists 1.02 ms; main thread visibility
+  about 3.4 ms (one check per shadow cascade). So: the 4 sun shadow
+  cascades over about 11,000 placed parts and 4,096 terrain patches, which
+  the wide view makes much larger, and the normal maps' 185 extra materials
+  that the custom material could not batch.
+
+**Fixed (normal maps):** the normal maps are converted to two-channel BC5
+at load (red, green; new encoder `bc4_block`, all cores, 198 in place and 5
+copies, 0.39 s), and the normal-mapped parts use Bevy's StandardMaterial
+with `normal_map_texture` and `flip_normal_map_y` (Bevy rebuilds z for
+two-channel maps and batches these materials). The custom `surface.rs` /
+`surface.wgsl` are removed (the strength switch with them;
+`BF1_NORMAL_MAPS=off` and `BF1_NORMAL_GREEN=keep` stay). New test: BC4
+blocks decode back within half a palette step.
+
+**Results:** at the user's spot about 102 to 111 fps with normal maps,
+106 to 110 without (no measurable cost now). The wall picture against the
+custom material: mean pixel difference 0.58, 0.1% of pixels change by more
+than 8. 25 game tests pass.
+
+**Still open:** the wide field of view costs about 25% (108 against about
+135 at 45 degrees), through the shadow cascades. Options: fewer cascades
+or a shorter shadow distance (small change, some look change), or merging
+static scenery into fewer, larger draw units (bigger change, no look
+change).
+
+## 2026-10-10: Normal maps on models, step 1 (plain textured parts)
+
+**Request (user):** the orchard stone wall looks nothing like the game.
+
+**Found (tested by Claude):**
+- Models were drawn with their colour texture only. The wall
+  (`wallstoneorchard_01_mesh`, material 0) also names
+  `T_WallStoneOrchard_01_N`: BC7, red and green = normal x, y (100% inside
+  the unit circle), blue = z (mean 0.94), alpha 1.
+- Survey of all placed meshes (EBX): 453 of 523 meshes (7,707 of 8,530
+  placements) have a normal texture; parameter mostly `Normal`; endings
+  `_N`, `_NM`, `_NMA`, `_NA`, `_NR`, `_NRM`, `_ND`, `_NAA`, `_NMS`, `_NMO`,
+  `_NTS` and more. One texture of each ending: red and green are x, y
+  (99 to 100% inside the unit circle) except the tree billboard `_NNTS`
+  (70%); blue and alpha differ by ending.
+
+**What changed (DESIGN.md "normal maps on models", step 1):**
+- Loader: `normal_texture` (variant first; parameters `Normal`, `_Normal`,
+  `Base_Texture_N`, `TrunkNormal`, `TexNormalmap`, `Normal_MetalMask_AO`,
+  `NormalMap`, `Normals`), kept only if 95% of a 64-pixel mip's red-green
+  texels are inside the unit circle; unpacked ahead with the others.
+  `tangents`: per-vertex tangents from the texture coordinates (along +u;
+  w so that w * cross(n, t) follows +v). New unit test.
+- New `surface.rs` / `surface.wgsl`: StandardMaterial (same texture,
+  cut-out) plus the normal texture, through Bevy's own
+  `calculate_tbn_mikktspace` and `apply_normal_mapping` with z rebuilt from
+  red and green and green flipped (the game's convention, as found on the
+  terrain: +green = -v). Used for plain textured parts (not yet painted,
+  detail, foliage or decal parts) and their scatter.
+- `BF1_NORMAL_MAPS=off` (or `=<strength>`); `BF1_NORMAL_GREEN=keep`
+  undoes the green flip (to compare, if bumps look lit from the wrong side).
+
+**Results (tested by Claude):**
+- 185 normal-mapped materials on 510 parts. Textures 280 -> 513 (249 ->
+  423 MB of GPU data). No shader errors. Light probe fingerprint unchanged.
+  24 game tests pass.
+- Wall view (`BF1_CAMERA="-283,61.9,36.5,180,-8"`, 2000 x 1125, the probe
+  hits the wall at 4.7 m), wall area: detail 1 px 9.1 -> 11.0, 4 px 17.8 ->
+  21.0, contrast 25.7 -> 27.2, dark quarter 61 -> 55; 18.6% of pixels
+  change by more than 8.
+- **Mistake (fixed):** one test command wrote its console output to
+  `/tmp/x` (the Windows Temp folder, outside the project); the file was
+  deleted in the same command and is gone. Scratch files go to the session
+  scratch folder.
+- The game screenshot's wall is much darker (mean 32 against 95), but from
+  another place, backlit, with much bright sky in view: the game's own
+  exposure adapts to the picture (we use a fixed exposure), so this is not
+  a fair brightness comparison. Not checked: the picture; the green
+  direction is our reading (from the terrain), not confirmed on models.
+
+## 2026-10-10: Camera field of view as in the game (100, Hor+ 116)
+
+**Request (user):** the camera's field of view should match the game
+screenshots. The user's game setting (options screenshot): "Field of view
+100 (Hor+ 116)".
+
+**Found:** the camera used Bevy's default, 45 degrees vertical (about 70
+horizontal at 16:9): much narrower than the game. The setting is the
+horizontal angle of a 4:3 picture; "Hor+" keeps the vertical angle and
+widens the sides: vertical = 2 atan(tan(50 deg) x 3/4) = 83.6 degrees,
+horizontal at 16:9 = 115.6 degrees (the game rounds to 116).
+
+**What changed:** `scene.rs`: `vertical_fov_from_game`; the camera uses
+the game's setting 100 by default; `BF1_GAME_FOV=<setting>` for another
+setting, `BF1_FOV=<vertical degrees>` as before. The log names the angles.
+New test (100 -> 83.6 vertical, 115.6 at 16:9, 100 back at 4:3). The view
+probe takes its rays from the camera, so it follows; the inspect key casts
+from the screen centre (not affected).
+
+**Checks (tested by Claude):** the log says "83.6 deg vertical (115.6 deg
+horizontal at 16:9)". 23 game tests pass. Not checked: the picture against
+the game (screenshot sent to the user).
+
+## 2026-10-10: Shiny leaves, step 1: smoothness from the foliage texture
+
+**Request (user):** the dark ivy and the ground foliage do not reflect the
+sun as in the game; moist spots on the ground should reflect too.
+
+**Found (tested by Claude):**
+- All meshes and scatter used a fixed roughness 0.85 (smoothness 0.15).
+- Foliage materials name a second texture: `NormalTranslucencySmoothnessMap`
+  (scatter shader presets) or `TexNormalmap` = `..._NTS` (vegetation). On
+  ivy leaf pixels (`t_wf_ivy_01_nts`, 64 x 128 mip): red 0.49, green 0.50
+  (normal map), blue 0.70, alpha 0.35; on empty pixels blue 0.995, alpha
+  0.10. Ground ivy `_NNRS` alpha on leaves 0.59. Read: alpha = smoothness.
+- Note on the probe: `texture-compare A B` takes A's channel as the 0.5
+  threshold and gives B's means (I first read it the other way round).
+
+**What changed (DESIGN.md "shiny leaves and wet ground", step 1):**
+- New `foliage.rs` / `foliage.wgsl`: StandardMaterial (same colour texture
+  and cut-out) plus the foliage texture; roughness = 1 - alpha per pixel.
+- Loader: `smoothness_texture` (parameter name with "Translucency", or a
+  texture name ending `_NTS` / `_NNRS`; from the variant first); also
+  unpacked ahead. Scatter parts can use it (`ScatterMaterial`).
+- First rule also matched `BaseColor_Smoothness` (books, concrete, crates,
+  fences: 28 materials, 63 parts); narrowed to foliage: 9 materials, 27
+  parts (ivy, ground ivy, hedge, dead branches, straw, ash bark tiling, a
+  destroyed tree, a splintered wood surface).
+- `BF1_SHINY_LEAVES=off` for the old fixed roughness.
+
+**Results (tested by Claude, numbers only):**
+
+| view | mean on / off | p90 brightness on / off | pixels changed > 8 |
+|---|---|---|---|
+| ivy tree at 8 m (`-216,65.5,-8,-4,12`) | [23, 36, 43] / [21, 33, 40] | 71 / 70 | 4.9% |
+| ground ivy (`-216,65.5,-8,-31,-45`) | [24, 32, 37] / [23, 31, 35] | 56 / 54 | 3.4% |
+
+The leaves now catch the sun where the angle is right, but the ivy stays
+much darker than in the game. Likely missing piece: the game's shiny
+surfaces also reflect the sky (we have no environment map), which is also
+what wet ground needs. Not checked: the picture.
+
+## 2026-10-10: Profiling the far-hill forest (graphics card time per step)
+
+**Request (user):** profile the frame rate properly, not only the
+screenshot number.
+
+**What changed:**
+- `BF1_PROFILE=on` adds Bevy's `RenderDiagnosticsPlugin`: the graphics card
+  time of every render step (timestamp queries, enabled by default on this
+  card). Every 5 s the log gets "gpu ms: total ..., render cpu ms total ...;
+  per step, slowest first: ...". These times do not depend on the window
+  being held at 60 fps.
+
+**Results (tested by Claude, 4 views x trees on and off
+(`BF1_SCATTER_CARRY=off`) x 2 runs, window 1280 x 720, game closed):**
+
+| view | trees | gpu ms total | main opaque pass ms | fps (capped runs left out) | scatter instances |
+|---|---|---|---|---|---|
+| hill (`-282.2,62.1,40.3,190,-5`) | on | 2.16, 2.18 | 1.08, 1.10 | 174 to 198 | 42,003 |
+| hill | off | 2.20, 2.14 | 1.13, 1.13 | 167 to 192 | 22,773 |
+| attacker spawn (`-216,65.5,-8,121,0`) | on | 1.99, 2.10 | 0.94, 1.11 | 202 to 231 | 32,149 |
+| attacker spawn | off | 2.19, 1.95 | 1.05, 0.95 | 199 to 224 | 12,919 |
+| mud path (`-257.6,70.0,14.4,408,-50`) | on | 1.44, 1.56 | 0.68, 0.83 | 203 to 210 | 34,188 |
+| mud path | off | 1.63, 1.52 | 0.90, 0.72 | 203 to 221 | 14,958 |
+| battle-area centre (start view) | on | 2.14, 2.12 | 0.92, 0.91 | 174 to 199 | 25,737 |
+| battle-area centre | off | 2.13, 2.29 | 0.96, 1.08 | 184 to 208 | 6,212 |
+
+- The far-hill forest (about 19,000 more backdrop cards) costs nothing
+  measurable: the differences are inside the run-to-run spread.
+- 5 of the 16 runs had samples at about 60 fps (both settings): the
+  window-behind-others cap, not the program.
+- The graphics card works about 2 ms per frame, but a frame takes about 5
+  ms (about 200 fps): the frame rate is limited by the processor's work per
+  frame (Bevy's per-entity work for about 11,000 placed parts plus the
+  scatter), not by the graphics card. A lead for later speed work.
+- User's own reading: 207 fps at the forested hill.
+
+## 2026-10-10: Forest on the far hills: scatter-only layers carried from coarser levels
+
+**Request (user):** make the change (DESIGN.md "layers carried from
+coarser levels").
+
+**Attempt 1 (failed, undone):** `weights_at` took each layer from the
+finest patch that lists it and mixed all layers in ascending order. The
+backdrop trees appeared (23,117 instead of 6,030), but:
+- the grass near the camera almost vanished (hill view 2 instead of 11,611
+  instances; mud view 0 instead of 6,285);
+- the ground blend in the battle area changed far too much (MudPile_02 33%
+  -> 8%, MudPile_05 3% -> 39%, GrassField02 19% -> 7%).
+Cause: layers carried from coarse levels (for example layer 11, full) were
+painted over the finer layers. The rule and its switch were removed.
+
+**Found in between (tested by Claude, new probe command `mask-bits`):**
+- In all 4,569 records the layers of a patch are stored in ascending order
+  (new count "patches whose layers are not in ascending order: 0").
+- The 11 bytes after `full` are a presence quadtree of the record's own
+  mask: bit 0 (the patch) is always set; bits 1 to 84 (4, 16, 64 cells
+  below, row order, low bit first) agree with "the mask is not zero in that
+  cell" for 95.8% of 383,796 bits. Against "a finer patch has its own
+  record of this layer" only 32 to 34% agree. So they do not say where a
+  layer carries on. (`MaskRecord` now keeps them, and the byte before
+  `full`.)
+
+**Attempt 2 (kept):**
+- The ground blend is unchanged (finest patch only), and so is the scatter
+  on layers with a ground texture (grass, yellow grass, ivy).
+- Scatter-only layers (12 to 17, no ground texture) take their own mask
+  from the finest patch that lists them (`LayerMasks::own_weight_at`; our
+  reading, not confirmed). `BF1_SCATTER_CARRY=off` for the old way.
+- New unit test (own mask from the finest patch that lists the layer; the
+  blend still uses the finest patch). All 41 tests pass.
+
+**Results (tested by Claude):**
+- Ground weights: identical with and without (no textured layer 1.8%, same
+  shares). Grass, yellow grass and ivy counts: identical.
+- Layer 16 (backdrop trees) cover 0.265 -> 1.175 km2 (0.18 km2 of it within
+  500 m of the centre); backdrop trees 5,651 -> 24,776. Layer 13 (branch
+  piles) 0 -> 0.019 km2, layers 14 and 15 a little, layer 17 0.039 -> 0.052.
+- The user's hill view (`BF1_CAMERA="-282.2,62.1,40.3,190,-5"`): the hill
+  band's mean colour [86, 93, 93] -> [64, 75, 79], median brightness 91 ->
+  66; the game screenshot's hill band [63, 75, 84], median 72. 51% of the
+  hill pixels change; the near ground below: 0.02 (no change).
+- Frame rate: all 4 runs at about 60 fps (the window-behind-others cap),
+  not reliable. Not checked: how the backdrop cards look near the battle
+  area.
+- **Checked by the user:** the trees on the far hills look about the same
+  as in the real game ("pretty much 1:1"); 207 fps looking at the forested
+  hill (`BF1_CAMERA="-280.3,64.0,35.2,175,-7"`, overlay screenshot).
+
+## 2026-10-10: Missing forest on the far hills: found in the coarse layer masks
+
+**Request (user):** our view at `BF1_CAMERA="-282.2,62.1,40.3,190,-5"`
+against the game: the hill north of it is dense forest in the game, mostly
+grass with a few trees in ours. Where would the trees be?
+
+**Found (tested by Claude, numbers only):**
+- No placed object makes that forest: in the view (300 to 1,500 m, 35
+  degrees either side) the Conquest layout places 6 objects (balloons, a
+  hay bale, 2 backdrop houses); with all game modes' sub-worlds, 9 (plus 3
+  flags).
+- Our terrain colour map there is grass-coloured (mean sRGB about [96, 94,
+  71]); our layer weights: layer 11 (`GrassBigTile`) 92%, layer 17 (ash
+  backdrop trees) 6%, and about 20% of the points with no layer at all.
+- **Each layer's own mask by quadtree level** (new probe output): layer 16
+  (`ms_dm_treebackdrop_01`, 3 scatter kinds) covers the hill at levels 0
+  to 2 (mean 0.43, 0.42, 0.42; 47 to 56% above 0.25) and is absent at
+  levels 3 and 4. `weights_at` uses only the finest patch at a point (here
+  level 3 or 4), so layer 16 is lost. Layer 11 is full at levels 0 to 3 and
+  absent at level 4: the points that use level 4 get no layer (the "no
+  layer" band).
+- Reading: a finer patch lists only the layers that have new detail there;
+  the other layers carry on from the coarser levels (the record's 85-bit
+  quadtree, not used yet, may say exactly where). Not confirmed.
+- New: `LayerMasks::raw_weight_at` and `raw_weight_at_level`; the probe's
+  `layer-grid` also prints the colour map per row, each layer's own mask
+  against the mixed weight, and per level.
+
+**Not changed yet:** the ground blend and the scatter still use the finest
+patch only. Plan: DESIGN.md "layers carried from coarser levels".
+
+## 2026-10-10: Faster start, steps 2 to 7: loading on all cores, less repeated work
+
+**What changed (DESIGN.md "faster start"), each checked separately:**
+- EBX (`fb_level::World::load`): the first entry of each name is read,
+  unpacked and parsed on all cores, then added in the old order (a later
+  entry of a name is only tried if the earlier one failed, as before).
+  1.20 s -> 0.32 s.
+- Archive index (`fb_vfs::GameFs::open`): the archive path is built and
+  looked up once per archive per cat, not once per entry. 0.80 s -> 0.24 s.
+- Terrain mesh (`terrain_mesh::build`): patch rows on all cores, results and
+  statistics merged in row order. About 0.95 s -> 0.16 s (scene setup
+  1.67 s -> 0.85 s). New checksum of the terrain mesh in the log.
+- Textures: the textures the meshes will ask for (colour or folder guess,
+  paint masks, detail textures; with variants) are unpacked on all cores
+  first (284 in 0.27 s; 4 not used); `load_texture` takes them from there
+  and unpacks anything else itself, as before. Time in textures during the
+  mesh loading: 0.64 to 0.75 s -> 0.00 s. Same for the 24 ground textures.
+- The shader database (159 MB) is read once while loading, not on every
+  shader texture lookup. Grass setup 0.19 s -> 0.07 s.
+- New log lines: time in mesh geometry and textures, textures unpacked
+  ahead (used or not).
+
+**Checks (tested by Claude):** after every step the light probe
+fingerprint stayed `2b3b801088956a63` (same meshes, parts, vertices,
+triangles, cut-out flags, placements and terrain); the terrain mesh
+checksum stayed `ade422bd415241bc` with the same hole and seam numbers;
+still 280 textures (249 MB), 28 cut-out; the probe's `level` command still
+finds 14,570 partitions, 8,530 placements, 0 broken links, 2,436 variant
+placements. All 40 tests pass.
+
+**Tried and undone (no gain):**
+- Reading the `cas.cat` and `.toc` files on all cores: the index time did
+  not change (0.78 to 0.86 s); the cost was the per-entry path work.
+- An array instead of a hash map for the vertex renumbering in
+  `load_mesh`: no measurable change (1.29 -> 1.40 s, noise).
+
+**Result:** level loading ends at about 2.2 s (was 4.1 s); first smooth
+frame at about 6.5 s (was about 22 s before step 1). What is left: Bevy's
+own start (window, graphics card) about 1.7 s after our loading, the scene
+setup 0.9 s, and the first frames about 1.7 s (shaders being prepared).
+
+## 2026-10-10: Faster start, step 1: light probe cache
+
+**Request (user):** the long start-up time adds up between tests; reduce
+it as much as possible without breaking anything.
+
+**Measured before (game log):** 20.6 s to the first frame. Light probes
+13.2 s (64%), loading 4.1 s, a 1.2 s gap, scene setup 1.6 s.
+
+**What changed (DESIGN.md "faster start", step 1):**
+- `probes.rs`: the baked boxes are saved to `cache/light_probes.bin`
+  (18.8 MB; git ignores `cache/`, checked with `git check-ignore`) with a
+  fingerprint of everything the bake reads (code version number, probe
+  constants, map centre, terrain heights, each mesh's name, vertices,
+  triangles, cut-out and decal flags, every placement). A matching file is
+  loaded instead of baking. The file is written through a temporary file.
+- `BF1_PROBE_CACHE=off` always bakes; `BF1_PROBE_CACHE=verify` bakes,
+  loads and logs whether they are the same.
+- New log lines: "scene setup started", and the first frames' times.
+- New test: the cache bytes round trip (no files; a wrong fingerprint or a
+  cut-short file is refused). 22 game tests pass.
+
+**Results (tested by Claude):**
+- First run: bakes as before and saves (level ready at 20.45 s).
+- Second run: "cache loaded: 62 boxes"; level ready at 7.06 s (13.4 s
+  sooner). Fingerprint: 0.02 s.
+- Verify run: "the cached bake is the same".
+- Found: the 1.2 s gap is Bevy starting the window and the graphics card,
+  after our loading (loading runs before the app starts). The first 5
+  frames take about 1.1 s (shaders being prepared); from frame 10 on, 3 to
+  5 ms. First smooth frame now at about 8.5 s (was about 22 s).
+
+**Note:** when the bake code changes, `CACHE_VERSION` in `probes.rs` must
+go up; changes to the data or the constants are seen by the fingerprint.
+
+## 2026-10-10: Third public release (a new commit on top)
+
+**Request (user):** update GitHub. The user chose a new commit on top of the single first commit (no force push).
+
+**What changed:** `publish/`: 11 files copied from the main folder (the
+decal, variation, backdrop tree and level check work, probe commands,
+README, MODLOG, DESIGN). Commit `63bc34b` on top of `7d636c5` (GitHub's
+current `main`, checked with a fetch): author `AaronSparks` with the GitHub
+private address, UTC time, Claude co-author line. Not pushed by Claude.
+
+**Checks (tested by Claude):** personal-data scan of the files and of the
+commit message: nothing found. The `publish/` copy builds by itself and
+passes all 39 tests.
+
 ## 2026-10-10: Decals drawn, with their variants (object variations)
 
 **Request (user):** do the decal variants.

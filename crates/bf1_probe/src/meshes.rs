@@ -508,6 +508,77 @@ fn decode_small(fs: &GameFs, world: &fb_level::World, name: &str, size: u32) -> 
     Ok((w, hgt, px.iter().map(|p| { let b = p.to_le_bytes(); [b[2] as f64 / 255.0, b[1] as f64 / 255.0, b[0] as f64 / 255.0, b[3] as f64 / 255.0] }).collect()))
 }
 
+/// Mean colour of a texture as sRGB bytes (from its 64-pixel mip; the
+/// decoder returns the stored bytes, which are sRGB for colour textures).
+pub fn texture_mean_srgb(fs: &GameFs, world: &fb_level::World, name: &str) -> Result<[f64; 3]> {
+    let (_, _, px) = decode_small(fs, world, name, 64)?;
+    let n = px.len() as f64;
+    Ok(std::array::from_fn(|c| px.iter().map(|p| p[c]).sum::<f64>() / n * 255.0))
+}
+
+/// `texture-png <superbundle> <texture> [width]`: the first mip of `width`
+/// pixels or less (default 512) as PNG files in `extracted/export` (git
+/// ignores it): the colour picture and one grey picture per channel. Per
+/// channel it logs the value spread and the patch size: the shift (in
+/// texels) at which the channel's autocorrelation falls under 0.5.
+pub fn cmd_texture_png(log: &mut Log, root: &std::path::Path, superbundle: &str, name: &str, width: u32) -> Result<()> {
+    let mut fs = GameFs::open(root)?;
+    fs.index_toc_chunks()?;
+    let fs = fs;
+    let world = fb_level::World::load(&fs, &[superbundle])?;
+    let (w, h, px) = decode_small(&fs, &world, name, width)?;
+    let leaf = name.rsplit('/').next().unwrap_or("texture");
+    let dir = std::path::PathBuf::from("extracted").join("export");
+    std::fs::create_dir_all(&dir)?;
+    let write = |path: &std::path::Path, colour: png::ColorType, bytes: &[u8]| -> Result<()> {
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(path)?), w as u32, h as u32);
+        enc.set_color(colour);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(bytes)?;
+        Ok(())
+    };
+    let byte = |v: f64| (v * 255.0).round() as u8;
+    let rgb: Vec<u8> = px.iter().flat_map(|p| [byte(p[0]), byte(p[1]), byte(p[2])]).collect();
+    let path = dir.join(format!("{leaf}_{w}.png"));
+    write(&path, png::ColorType::Rgb, &rgb)?;
+    log.line(format!("{name}: mip {w}x{h}, wrote {}", path.display()));
+    for (c, label) in ["red", "green", "blue", "alpha"].iter().enumerate() {
+        let v: Vec<f64> = px.iter().map(|p| p[c]).collect();
+        let path = dir.join(format!("{leaf}_{w}_{label}.png"));
+        write(&path, png::ColorType::Grayscale, &v.iter().map(|&x| byte(x)).collect::<Vec<u8>>())?;
+        let n = v.len() as f64;
+        let mean = v.iter().sum::<f64>() / n;
+        let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+        if var < 1e-8 {
+            log.line(format!("  {label}: constant {mean:.3}"));
+            continue;
+        }
+        // Autocorrelation for a shift (dx, dy), wrapping at the edges (the texture repeats).
+        let ac = |dx: usize, dy: usize| -> f64 {
+            let mut s = 0.0;
+            for y in 0..h {
+                for x in 0..w {
+                    s += (v[y * w + x] - mean) * (v[((y + dy) % h) * w + (x + dx) % w] - mean);
+                }
+            }
+            s / (n * var)
+        };
+        let half_x = (1..w / 2).find(|&d| ac(d, 0) < 0.5).unwrap_or(w / 2);
+        let half_y = (1..h / 2).find(|&d| ac(0, d) < 0.5).unwrap_or(h / 2);
+        let step = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| (v[y * w + x] - v[y * w + (x + 1) % w]).abs()).sum::<f64>() / n;
+        let share = |f: &dyn Fn(f64) -> bool| 100.0 * v.iter().filter(|&&x| f(x)).count() as f64 / n;
+        log.line(format!(
+            "  {label}: mean {mean:.3}, sd {:.3}, under 0.1 {:.1}%, over 0.9 {:.1}%, mean step to the next texel {step:.3}; patch size (autocorrelation under 0.5) x {half_x}, y {half_y} texels of {w} ({:.1}% of the width); wrote {}",
+            var.sqrt(),
+            share(&|x| x < 0.1),
+            share(&|x| x > 0.9),
+            100.0 * half_x as f64 / w as f64,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// `texture-compare <superbundle> <texture A> <channel A> <texture B> <channel B>`:
 /// correlation between one channel of each texture (channels r, g, b, a),
 /// both decoded at 64 pixels wide (B is resampled to A's size). A strong
@@ -553,6 +624,57 @@ pub fn cmd_texture_compare(log: &mut Log, root: &std::path::Path, superbundle: &
 /// of LOD 0 (usage, format, offset, stream), and for texture coordinate
 /// elements (usage 0x20 to 0x2f) the range of u and v and the median metres
 /// per texture repeat (mesh units per UV unit along triangle edges).
+/// `mesh-dump <superbundle> <mesh> <file>`: every vertex element of LOD 0
+/// as text, for study: lines "s <section> <material id> <vertices>
+/// <triangles>", "v <section> <usage>=<values> ..." and "f <section> a b c"
+/// (indices inside the section).
+pub fn cmd_mesh_dump(log: &mut Log, root: &std::path::Path, superbundle: &str, mesh_name: &str, path: &str) -> Result<()> {
+    use anyhow::Context;
+    use fb_res::mesh::{format_size, read_element};
+    let mut fs = GameFs::open(root)?;
+    fs.index_toc_chunks()?;
+    let world = fb_level::World::load(&fs, &[superbundle])?;
+    let part = world.partition_by_name(mesh_name).with_context(|| format!("{mesh_name} not found"))?;
+    let Some(Value::ResourceRef(rid)) = world.get((part, 0)).get("MeshSetResource") else { anyhow::bail!("no MeshSetResource") };
+    let ms = parse_meshset(&world.read_res(&fs, *rid)?)?;
+    let lod = ms.lods.first().context("no LODs")?;
+    let buffer = world.read_chunk(&fs, &lod.chunk_id.context("inline mesh data")?)?;
+    let index_size = if lod.index_format == fb_res::mesh::INDEX_FORMAT_U16 { 2 } else { 4 };
+    let ib = &buffer[lod.vertex_buffer_size as usize..];
+    let mut out = String::new();
+    for (si, s) in lod.sections.iter().enumerate() {
+        let d = &s.declaration;
+        out.push_str(&format!("s {si} {} {} {}\n", s.material_id, s.vertex_count, s.primitive_count));
+        let base = |stream: u8| -> usize { s.vertex_offset as usize + d.stream_strides.iter().take(stream as usize).map(|&st| st as usize * s.vertex_count as usize).sum::<usize>() };
+        let stride = |stream: u8| -> usize { d.stream_strides.get(stream as usize).copied().unwrap_or(s.stride) as usize };
+        for v in 0..s.vertex_count as usize {
+            out.push_str(&format!("v {si}"));
+            for e in &d.elements {
+                let at = base(e.stream) + v * stride(e.stream) + e.offset as usize;
+                let vals = format_size(e.format).and_then(|n| buffer.get(at..at + n)).and_then(|b| read_element(e.format, b));
+                match vals {
+                    Some(x) => out.push_str(&format!(" {:02x}={},{},{},{}", e.usage, x[0], x[1], x[2], x[3])),
+                    None => out.push_str(&format!(" {:02x}=?", e.usage)),
+                }
+            }
+            out.push('\n');
+        }
+        for t in 0..s.primitive_count as usize {
+            let idx = |k: usize| -> Option<u32> {
+                let at = (s.start_index as usize + t * 3 + k) * index_size;
+                let b = ib.get(at..at + index_size)?;
+                Some(if index_size == 2 { u16::from_le_bytes([b[0], b[1]]) as u32 } else { u32::from_le_bytes(b.try_into().ok()?) })
+            };
+            if let (Some(a), Some(b), Some(c)) = (idx(0), idx(1), idx(2)) {
+                out.push_str(&format!("f {si} {a} {b} {c}\n"));
+            }
+        }
+    }
+    std::fs::write(path, out)?;
+    log.line(format!("{mesh_name}: {} sections written to {path}", lod.sections.len()));
+    Ok(())
+}
+
 pub fn cmd_mesh_elements(log: &mut Log, root: &std::path::Path, superbundle: &str, mesh_name: &str, samples: &[(u8, String)], alpha: Option<&str>) -> Result<()> {
     use anyhow::Context;
     use fb_res::mesh::{format_size, read_element, usage};

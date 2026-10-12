@@ -316,7 +316,7 @@ fn repeat_sampler() -> ImageSampler {
 }
 
 /// All mips of a block-compressed texture as RGBA8 bytes, largest first.
-fn decode_all_mips(t: &TextureData) -> Option<Vec<u8>> {
+pub(crate) fn decode_all_mips(t: &TextureData) -> Option<Vec<u8>> {
     let block_bytes = match t.format {
         BlockFormat::Bc1 { .. } => 8,
         BlockFormat::Bc3 { .. } | BlockFormat::Bc7 { .. } => 16,

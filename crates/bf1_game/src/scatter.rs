@@ -45,12 +45,19 @@ pub struct ScatterKind {
     pub max_scale: [f32; 2],
     pub distance: f32,
     /// The mesh's drawn parts with their materials.
-    pub parts: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
+    pub parts: Vec<(Handle<Mesh>, ScatterMaterial)>,
     /// Ground-coloured blades: tint (linear).
     pub ground_tint: Option<[f32; 3]>,
     /// One flat card: the turn of its face about the vertical axis in mesh
     /// space (radians). Such instances face the camera.
     pub card_facing: Option<f32>,
+}
+
+/// Material of a scatter part: plain, or shiny leaves (`foliage.rs`).
+#[derive(Clone)]
+pub enum ScatterMaterial {
+    Standard(Handle<StandardMaterial>),
+    Foliage(Handle<crate::foliage::FoliageMaterial>),
 }
 
 /// A scatter card that faces the camera; the value is `card_facing`.
@@ -69,6 +76,10 @@ pub struct Scatter {
     pub layer_colour: Vec<Option<[f32; 3]>>,
     density_factor: f32,
     distance_factor: f32,
+    /// See `carry_on`.
+    carry: bool,
+    /// Scatter instances cast shadows (test switch `BF1_SCATTER_SHADOWS=off`).
+    shadows: bool,
     /// Spawned tiles: (kind, tile x, tile z) -> (parent entity if any
     /// instances, instances).
     tiles: HashMap<(usize, i32, i32), (Option<Entity>, usize)>,
@@ -87,6 +98,8 @@ impl Scatter {
             layer_colour,
             density_factor: env("BF1_SCATTER_DENSITY"),
             distance_factor: env("BF1_SCATTER_DISTANCE"),
+            carry: carry_on(),
+            shadows: std::env::var("BF1_SCATTER_SHADOWS").map_or(true, |v| v != "off"),
             tiles: HashMap::new(),
             tinted: HashMap::new(),
             last_update: None,
@@ -115,8 +128,28 @@ impl Rng {
     }
 }
 
+/// Whether scatter-only layers take their own mask from the finest patch
+/// that lists them (DESIGN.md "layers carried from coarser levels", attempt
+/// 2); `BF1_SCATTER_CARRY=off` uses the blended weight for all layers (old).
+pub fn carry_on() -> bool {
+    std::env::var("BF1_SCATTER_CARRY").map_or(true, |v| v != "off")
+}
+
+/// Scatter weight of `layer` at (x, z): for a layer with a ground texture the
+/// blended weight (finest patch); for a scatter-only layer its own mask from
+/// the finest patch that lists it. None outside the terrain.
+pub fn scatter_weight(masks: &fb_terrain::layers::LayerMasks, x: f32, z: f32, layer: usize, textured: bool, carry: bool, w: &mut [f32; MAX_LAYERS]) -> Option<f32> {
+    if textured || !carry {
+        masks.weights_at(x, z, &[false; MAX_LAYERS], w)?;
+        Some(w[layer])
+    } else {
+        masks.own_weight_at(x, z, layer as u8)
+    }
+}
+
 /// Instance transforms for one tile of one kind.
-fn tile_points(kind_index: usize, kind: &ScatterKind, tx: i32, tz: i32, tile: f32, ground: &Ground, density_factor: f32) -> Vec<Transform> {
+#[allow(clippy::too_many_arguments)]
+fn tile_points(kind_index: usize, kind: &ScatterKind, tx: i32, tz: i32, tile: f32, ground: &Ground, density_factor: f32, textured: bool, carry: bool) -> Vec<Transform> {
     let Some(masks) = ground.0.layers.as_ref() else { return vec![] };
     let mut rng = Rng::new(kind_index, tx, tz);
     let expected = kind.density * density_factor * tile * tile;
@@ -127,7 +160,7 @@ fn tile_points(kind_index: usize, kind: &ScatterKind, tx: i32, tz: i32, tile: f3
         let (x, z) = ((tx as f32 + rng.f()) * tile, (tz as f32 + rng.f()) * tile);
         let keep = rng.f();
         let (yaw, hs, vs) = (rng.f() * std::f32::consts::TAU, rng.f(), rng.f());
-        if masks.weights_at(x, z, &[false; MAX_LAYERS], &mut w).is_none() || keep >= w[kind.layer] {
+        if scatter_weight(masks, x, z, kind.layer, textured, carry, &mut w).is_none_or(|weight| keep >= weight) {
             continue;
         }
         let Some(y) = ground.0.height_at(x, z) else { continue };
@@ -223,7 +256,8 @@ pub fn update_scatter(
                 break;
             }
             budget -= 1;
-            let points = tile_points(k, &scatter.kinds[k], tx, tz, tile, &ground, scatter.density_factor);
+            let textured = scatter.layer_colour.get(scatter.kinds[k].layer).is_some_and(Option::is_some);
+            let points = tile_points(k, &scatter.kinds[k], tx, tz, tile, &ground, scatter.density_factor, textured, scatter.carry);
             if points.is_empty() {
                 scatter.tiles.insert((k, tx, tz), (None, 0));
                 continue;
@@ -257,14 +291,22 @@ pub fn update_scatter(
             commands.entity(parent).with_children(|c| {
                 for t in &points {
                     for (mesh, material) in &kind.parts {
-                        let material = MeshMaterial3d(tint_material.clone().unwrap_or_else(|| material.clone()));
-                        match kind.card_facing {
-                            Some(f) => {
-                                let t = Transform { rotation: Quat::from_rotation_y(card_yaw(p, t.translation, f)), ..*t };
-                                c.spawn((Mesh3d(mesh.clone()), material, t, FacingCard(f)))
-                            }
-                            None => c.spawn((Mesh3d(mesh.clone()), material, *t)),
+                        let material = tint_material.clone().map(ScatterMaterial::Standard).unwrap_or_else(|| material.clone());
+                        let t = match kind.card_facing {
+                            Some(f) => Transform { rotation: Quat::from_rotation_y(card_yaw(p, t.translation, f)), ..*t },
+                            None => *t,
                         };
+                        let mut e = c.spawn((Mesh3d(mesh.clone()), t));
+                        match material {
+                            ScatterMaterial::Standard(h) => e.insert(MeshMaterial3d(h)),
+                            ScatterMaterial::Foliage(h) => e.insert(MeshMaterial3d(h)),
+                        };
+                        if let Some(f) = kind.card_facing {
+                            e.insert(FacingCard(f));
+                        }
+                        if !scatter.shadows {
+                            e.insert(bevy::light::NotShadowCaster);
+                        }
                     }
                 }
             });

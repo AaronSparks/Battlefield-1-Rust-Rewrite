@@ -52,5 +52,11 @@ pub fn fly_camera(
         }
         let fast = if keys.pressed(KeyCode::ShiftLeft) { 6.0 } else { 1.0 };
         tf.translation += dir.normalize_or_zero() * cam.speed * fast * dt;
+        // Test switch: BF1_AUTOFLY=<metres per second> flies straight ahead
+        // (level, along the view's heading) to measure the frame rate while moving.
+        if let Some(speed) = std::env::var("BF1_AUTOFLY").ok().and_then(|v| v.parse::<f32>().ok()) {
+            let ahead = Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
+            tf.translation += ahead * speed * dt.min(0.1);
+        }
     }
 }

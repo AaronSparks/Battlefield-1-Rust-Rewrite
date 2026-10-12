@@ -5,6 +5,54 @@ MODLOG steps 3a to 3c). Open: the exact blend rule, ground normal maps,
 secondary textures per layer, texture repeat sizes. The older sections below
 are kept as a record of the attempts.
 
+## Update 10 (2026-10-11): footprints on the trench floors NOT SOLVED; layers 11 and 18 exchanged
+
+Written because AGENTS.md says to stop after two real attempts that fail.
+
+**The problem.** In the real game, most trench floors and paths show the
+footprint texture (`T_V_FootPrints_01_CS`; user screenshots 68 to 73, around
+the crates and sandbags at x -260, z 10). We show the mud pile texture
+(`T_Gen_MudPile_02_CS`, layer 0) there.
+
+**What is known (checked on the data):**
+- Layer 9 = footprints (79 shader names, slot order agrees). Its own mask
+  covers 3% of the battle area (400 m around x -80, z -230), 2% after the
+  blend: the later layers do not hide it.
+- At the inspected point (-261.9, 10.2) no patch at any level lists layer
+  9. A strip of layer 9 with sharp edges is 6 m east (x -256 to -250).
+- The mud pile texture has no footprints; the footprint texture clearly has.
+- The masks are complete: 77 nodes, 0 count mismatches, 0 edge mismatches.
+
+**What was tried and failed:**
+1. Texture repeat 12 m instead of 6 m: the user says much too big.
+2. The other textures of the terrain shaders: `T_Variation_03_RGB` (soft
+   colour patches, in every shader) and `T_Gen_Side_Flows_01_NRH` (a normal
+   map of water channels; goes with layers 0, 1, 8 and 9, see update 8). No
+   footprints in either.
+3. The layer numbering (below): found an error, but it does not move layer 9.
+
+**Found on the way: record layers 11 and 18 are probably exchanged.** Test
+`bf1_probe layer-combos` (patch layer sets without the scatter-only layers
+against the 185 shader-name layer sets, exact match, levels 0 to 3): with our
+numbering 12 of 848 match; with 11 and 18 exchanged 770 of 848 (91%). A
+search over all further pair exchanges adds at most 19 (0.2% each; probably
+noise). Second, independent check (`bf1_probe layer-colours`): where record
+layer 11 is dominant (241,802 points, mostly outside the battle area) the
+game's colour map is brown-grey [103, 93, 75], close to `MudPile_05`
+[100, 87, 76] and far from `GrassBigTile` [82, 89, 37]; where record 18 is
+dominant it is greener [98, 103, 77]. This corrects update 9's numbering
+claim (that test used "fits inside", which nearly every set does). Not
+applied in the game yet.
+
+**Ideas for the next attempt (not tried):**
+- The meaning of the record's unknown byte before `full` and of the 9 extra
+  bytes after some records (103 times): one of them could scale a layer.
+- A blend by the textures' height channels (the H of `_NRH`) instead of our
+  "paint over" rule: this can make a layer show more strongly, but only where
+  its mask is above 0 (3% for layer 9), so it cannot explain it alone.
+- Compare a real-game screenshot with a known position: the user stands at a
+  marked object, we compute where layer 9 should be in that view.
+
 Date: 2026-10-03. Written because AGENTS.md says to stop after two real
 attempts that fail, instead of trying variations at random.
 

@@ -57,26 +57,17 @@ impl World {
             parse_failures: 0,
         };
         let mut stats = BlockStats::default();
+        // EBX entries of all bundles in order; the first of each name is read
+        // and parsed on all cores (DESIGN.md "faster start", step 4), then
+        // added in this order, as before.
+        let mut ebx: Vec<(String, DbValue)> = Vec::new();
         for sb_name in superbundles {
             let sb = Superbundle::open(fs, sb_name)?;
             for b in &sb.bundles {
                 let bundle = sb.read_bundle(b)?;
                 for e in bundle.get("ebx").and_then(DbValue::as_list).unwrap_or(&[]) {
                     let name = e.get("name").and_then(DbValue::as_str).context("ebx without name")?.to_lowercase();
-                    if world.by_name.contains_key(&name) {
-                        continue;
-                    }
-                    let parsed = read_entry(fs, EntryKind::Ebx, e, &mut stats).and_then(|d| fb_ebx::parse(&d));
-                    match parsed {
-                        Ok(p) => {
-                            let i = world.partitions.len();
-                            world.by_guid.insert(p.file_guid, i);
-                            world.by_name.insert(name.clone(), i);
-                            world.partitions.push(p);
-                            world.names.push(name);
-                        }
-                        Err(_) => world.parse_failures += 1,
-                    }
+                    ebx.push((name, e.clone()));
                 }
                 for e in bundle.get("chunks").and_then(DbValue::as_list).unwrap_or(&[]) {
                     if let Some(id) = e.get("id").and_then(DbValue::as_guid) {
@@ -91,6 +82,48 @@ impl World {
                         world.res_named.entry(n.to_lowercase()).or_insert_with(|| e.clone());
                     }
                 }
+            }
+        }
+        // Parse the first entry of each name in parallel.
+        let mut first: HashMap<&str, usize> = HashMap::new();
+        for (i, (name, _)) in ebx.iter().enumerate() {
+            first.entry(name.as_str()).or_insert(i);
+        }
+        let mut todo: Vec<usize> = first.values().copied().collect();
+        todo.sort_unstable();
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32);
+        let mut parsed: HashMap<usize, Result<Partition>> = std::thread::scope(|sc| {
+            let jobs: Vec<_> = todo
+                .chunks(todo.len().div_ceil(threads).max(1))
+                .map(|part| {
+                    let ebx = &ebx;
+                    sc.spawn(move || {
+                        let mut st = BlockStats::default();
+                        part.iter().map(|&i| (i, read_entry(fs, EntryKind::Ebx, &ebx[i].1, &mut st).and_then(|d| fb_ebx::parse(&d)))).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            jobs.into_iter().flat_map(|j| j.join().unwrap_or_default()).collect()
+        });
+        // Add them in bundle order. A later entry of a name is only tried if
+        // the earlier ones failed (as the one-by-one reading did).
+        for (i, (name, e)) in ebx.iter().enumerate() {
+            if world.by_name.contains_key(name) {
+                continue;
+            }
+            let result = match parsed.remove(&i) {
+                Some(r) => r,
+                None => read_entry(fs, EntryKind::Ebx, e, &mut stats).and_then(|d| fb_ebx::parse(&d)),
+            };
+            match result {
+                Ok(p) => {
+                    let i = world.partitions.len();
+                    world.by_guid.insert(p.file_guid, i);
+                    world.by_name.insert(name.clone(), i);
+                    world.partitions.push(p);
+                    world.names.push(name.clone());
+                }
+                Err(_) => world.parse_failures += 1,
             }
         }
         Ok(world)

@@ -34,6 +34,12 @@ pub struct MaskRecord {
     pub rect: [f32; 4],
     /// The layer covers the whole patch (no stored mask).
     pub full: bool,
+    /// The byte before `full` (meaning not known).
+    pub aux: u8,
+    /// The 11 bytes after `full`: probably an 85-bit quadtree (this patch,
+    /// then 4, 16 and 64 cells below it). Kept for study (DESIGN.md "layers
+    /// carried from coarser levels").
+    pub tree: [u8; 11],
 }
 
 /// A layer of a patch, in paint order.
@@ -56,6 +62,8 @@ pub struct LayerMasks {
     pub masks: Vec<u8>,
     /// Finest level that has records.
     pub finest: u32,
+    /// All records (also those whose masks could not be used), for study.
+    pub records: Vec<MaskRecord>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +86,9 @@ pub struct MaskStats {
     pub edge_x_different: usize,
     pub edge_z_equal: usize,
     pub edge_z_different: usize,
+    /// Patches whose layers are not in ascending order (0 means the stored
+    /// order is the layer order).
+    pub patches_not_ascending: usize,
 }
 
 fn f32_at(d: &[u8], at: usize) -> Option<f32> {
@@ -134,7 +145,11 @@ pub fn parse_mask_section(tree: &[u8], after_block_a: usize, min: [f32; 2], widt
     // Verdun), so only its start must be inside the section.
     while out.len() < stats.header_count && p < end && p + 19 <= tree.len() {
         let rect = rect_at(tree, p + 1, min, width).with_context(|| format!("mask record {} at {p}: no rect", out.len()))?;
-        out.push(MaskRecord { layer: tree[p], rect, full: tree[p + 18] != 0 });
+        let mut bits = [0u8; 11];
+        if let Some(b) = tree.get(p + 19..p + 30) {
+            bits.copy_from_slice(b);
+        }
+        out.push(MaskRecord { layer: tree[p], rect, full: tree[p + 18] != 0, aux: tree[p + 17], tree: bits });
         let q = p + 30;
         if out.len() == stats.header_count || q >= end {
             break;
@@ -164,7 +179,7 @@ impl LayerMasks {
     }
 
     /// Level and patch position of a record.
-    fn patch_of(&self, r: &MaskRecord) -> (u32, u32, u32) {
+    pub fn patch_of(&self, r: &MaskRecord) -> (u32, u32, u32) {
         let s = r.rect[2] - r.rect[0];
         let per_side = (self.width / s).round() as u32;
         let level = (per_side / PATCHES).trailing_zeros();
@@ -175,7 +190,7 @@ impl LayerMasks {
     /// returns the node's mask bytes (everything after heights and block A, without
     /// the final layer), if the node has a chunk.
     pub fn build(records: &[MaskRecord], min: [f32; 2], width: f32, node_masks: impl Fn(u32, u32, u32) -> Option<Vec<u8>>, stats: &mut MaskStats) -> LayerMasks {
-        let mut lm = LayerMasks { min, width, ..Default::default() };
+        let mut lm = LayerMasks { min, width, records: records.to_vec(), ..Default::default() };
         // Records of each node, in order.
         let mut by_node: Vec<((u32, u32, u32), Vec<(u32, u32, MaskRecord)>)> = Vec::new();
         let mut index: HashMap<(u32, u32, u32), usize> = HashMap::new();
@@ -229,10 +244,11 @@ impl LayerMasks {
             }
         }
         lm.edge_check(stats);
+        stats.patches_not_ascending = lm.patches.values().filter(|l| l.windows(2).any(|w| w[0].layer >= w[1].layer)).count();
         lm
     }
 
-    fn mask(&self, i: u32) -> &[u8] {
+    pub fn mask(&self, i: u32) -> &[u8] {
         &self.masks[i as usize * MASK_BYTES..(i as usize + 1) * MASK_BYTES]
     }
 
@@ -303,6 +319,78 @@ impl LayerMasks {
     }
 }
 
+impl LayerMasks {
+    /// One layer's own mask value at (x, z), not mixed with the layers painted
+    /// after it (0 if the patch does not have the layer); None if no patch
+    /// covers the point. For scatter-only layers (DESIGN.md "trees on the far
+    /// hills").
+    /// One layer's own mask at (x, z) in the patch of one quadtree level
+    /// (None if that level has no patch there).
+    pub fn raw_weight_at_level(&self, x: f32, z: f32, layer: u8, level: u32) -> Option<f32> {
+        let (fx, fz) = ((x - self.min[0]) / self.width, (z - self.min[1]) / self.width);
+        if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fz) {
+            return None;
+        }
+        let n = (PATCHES << level) as f32;
+        let (gx, gz) = ((fx * n).min(n - 1e-4), (fz * n).min(n - 1e-4));
+        let layers = self.patches.get(&(level, gx as u32, gz as u32))?;
+        let (u, v) = (gx.fract() * 64.0, gz.fract() * 64.0);
+        Some(match layers.iter().find(|pl| pl.layer == layer) {
+            Some(pl) => match pl.mask {
+                None => 1.0,
+                Some(i) => sample(self.mask(i), u, v) / 255.0,
+            },
+            None => 0.0,
+        })
+    }
+
+    /// One layer's own mask at (x, z) from the finest patch that lists the
+    /// layer (0 if none does; None outside the terrain). For scatter-only
+    /// layers, which a finer patch may not list even where a coarser one has
+    /// them (DESIGN.md "layers carried from coarser levels", attempt 2).
+    pub fn own_weight_at(&self, x: f32, z: f32, layer: u8) -> Option<f32> {
+        let (fx, fz) = ((x - self.min[0]) / self.width, (z - self.min[1]) / self.width);
+        if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fz) {
+            return None;
+        }
+        for level in (0..=self.finest).rev() {
+            if let Some(m) = self.raw_weight_at_level(x, z, layer, level).filter(|_| self.lists(x, z, layer, level)) {
+                return Some(m);
+            }
+        }
+        Some(0.0)
+    }
+
+    /// Whether the patch of `level` at (x, z) has a record of `layer`.
+    fn lists(&self, x: f32, z: f32, layer: u8, level: u32) -> bool {
+        let (fx, fz) = ((x - self.min[0]) / self.width, (z - self.min[1]) / self.width);
+        let n = (PATCHES << level) as f32;
+        let (gx, gz) = ((fx * n).min(n - 1e-4), (fz * n).min(n - 1e-4));
+        self.patches.get(&(level, gx as u32, gz as u32)).is_some_and(|v| v.iter().any(|pl| pl.layer == layer))
+    }
+
+    pub fn raw_weight_at(&self, x: f32, z: f32, layer: u8) -> Option<f32> {
+        let (fx, fz) = ((x - self.min[0]) / self.width, (z - self.min[1]) / self.width);
+        if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fz) {
+            return None;
+        }
+        for level in (0..=self.finest).rev() {
+            let n = (PATCHES << level) as f32;
+            let (gx, gz) = ((fx * n).min(n - 1e-4), (fz * n).min(n - 1e-4));
+            let Some(layers) = self.patches.get(&(level, gx as u32, gz as u32)) else { continue };
+            let (u, v) = (gx.fract() * 64.0, gz.fract() * 64.0);
+            return Some(match layers.iter().find(|pl| pl.layer == layer) {
+                Some(pl) => match pl.mask {
+                    None => 1.0,
+                    Some(i) => sample(self.mask(i), u, v) / 255.0,
+                },
+                None => 0.0,
+            });
+        }
+        None
+    }
+}
+
 /// Bilinear sample of a 66 x 66 mask at (u, v) in 0..=64.
 fn sample(m: &[u8], u: f32, v: f32) -> f32 {
     let (x0, y0) = (u.floor() as usize, v.floor() as usize);
@@ -349,12 +437,34 @@ mod tests {
     }
 
     #[test]
+    fn own_weight_comes_from_the_finest_patch_that_lists_the_layer() {
+        // Level 0 patch (0, 0): layer 2 full, layer 16 at 128/255. Level 1
+        // patch (0, 0): only layer 4 at 64/255. The point lies in both.
+        let mut lm = LayerMasks { min: [0.0, 0.0], width: 16.0, finest: 1, ..Default::default() };
+        lm.masks.extend(std::iter::repeat_n(128u8, MASK_BYTES));
+        lm.masks.extend(std::iter::repeat_n(64u8, MASK_BYTES));
+        lm.patches.insert((0, 0, 0), vec![PatchLayer { layer: 2, mask: None }, PatchLayer { layer: 16, mask: Some(0) }]);
+        lm.patches.insert((1, 0, 0), vec![PatchLayer { layer: 4, mask: Some(1) }]);
+        let close = |a: Option<f32>, b: f32| a.is_some_and(|a| (a - b).abs() < 1e-5);
+        assert!(close(lm.own_weight_at(0.5, 0.5, 16), 128.0 / 255.0));
+        assert!(close(lm.own_weight_at(0.5, 0.5, 4), 64.0 / 255.0));
+        assert!(close(lm.own_weight_at(0.5, 0.5, 2), 1.0));
+        assert!(close(lm.own_weight_at(0.5, 0.5, 7), 0.0));
+        assert_eq!(lm.own_weight_at(-1.0, 0.5, 16), None);
+        // The blend still uses the finest patch only.
+        let mut w = [0f32; MAX_LAYERS];
+        lm.weights_at(0.5, 0.5, &[false; MAX_LAYERS], &mut w);
+        assert!((w[4] - 64.0 / 255.0).abs() < 1e-5 && w[2] == 0.0 && w[16] == 0.0, "{w:?}");
+    }
+
+    #[test]
     fn parses_records() {
         let t = tiny_tree();
         let (recs, st) = parse_mask_section(&t, 0, [-8.0, -8.0], 16.0).unwrap();
         assert_eq!(st.header_count, 2);
         assert_eq!(recs.len(), 2);
         assert_eq!((recs[0].layer, recs[0].full), (0, true));
+        assert_eq!(recs[0].tree, [0xff; 11]);
         assert_eq!((recs[1].layer, recs[1].full), (3, false));
     }
 

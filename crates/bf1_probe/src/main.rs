@@ -215,6 +215,36 @@ fn run() -> Result<()> {
             for (t, (n, slots)) in &uses {
                 log.line(format!("  {n:4} shaders, slots {slots:?}: {t}"));
             }
+            // --detail <n>: the letters after each layer number in the shader
+            // names (for example "0MV"), counted per layer, and the full slot
+            // list of the first n shaders.
+            if let Some(n) = args.iter().position(|a| a == "--detail").and_then(|i| args.get(i + 1)).map(|s| s.parse::<usize>()).transpose()? {
+                let mut letters: std::collections::BTreeMap<u32, std::collections::BTreeMap<String, usize>> = std::collections::BTreeMap::new();
+                for (name, _) in &shaders {
+                    let leaf = name.rsplit('/').next().unwrap_or("");
+                    let Some(combo) = leaf.split("__").nth(1) else { continue };
+                    for l in combo.split('_') {
+                        let digits: String = l.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        let Ok(layer) = digits.parse::<u32>() else { continue };
+                        *letters.entry(layer).or_default().entry(l[digits.len()..].to_string()).or_default() += 1;
+                    }
+                }
+                log.line("letters after each layer number (letters: shaders):");
+                for (layer, m) in &letters {
+                    log.line(format!("  layer {layer:2}: {m:?}"));
+                }
+                for (name, layers) in shaders.iter().take(n) {
+                    log.line(format!("{} (layers {layers:?})", name.rsplit('/').next().unwrap_or(name)));
+                    let mut seen = std::collections::BTreeSet::new();
+                    for b in sdb.blocks_of(name) {
+                        for (slot, t) in sdb.block_texture_slots(b) {
+                            if seen.insert((slot, t.clone())) {
+                                log.line(format!("  slot {slot:3}: {}", t.rsplit('/').next().unwrap_or(&t)));
+                            }
+                        }
+                    }
+                }
+            }
         }
         "shader-textures" => {
             // shader-textures <superbundle> <level> <shader name>...: texture lists from the level shader database.
@@ -259,12 +289,33 @@ fn run() -> Result<()> {
             }
             meshes::cmd_mesh_elements(&mut log, &root, args.get(1).context("missing superbundle name")?, args.get(2).context("missing mesh name")?, &samples, alpha.as_deref())?
         }
+        "mesh-dump" => {
+            // mesh-dump <superbundle> <mesh> <file>
+            let arg = |i: usize| args.get(i).map(|s| s.as_str()).context("usage: mesh-dump <superbundle> <mesh> <file>");
+            meshes::cmd_mesh_dump(&mut log, &root, arg(1)?, arg(2)?, arg(3)?)?
+        }
+        "texture-png" => {
+            // texture-png <superbundle> <texture> [width]
+            let width = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(512);
+            meshes::cmd_texture_png(&mut log, &root, args.get(1).context("missing superbundle name")?, args.get(2).context("missing texture name")?, width)?
+        }
         "texture-compare" => {
             let arg = |i: usize| args.get(i).map(|s| s.as_str()).context("usage: texture-compare <superbundle> <texture A> <r|g|b|a> <texture B> <r|g|b|a>");
             meshes::cmd_texture_compare(&mut log, &root, arg(1)?, arg(2)?, arg(3)?, arg(4)?, arg(5)?)?
         }
         "terrain-chunks-save-all" => terrain::cmd_terrain_chunks_save_all(&mut log, &root, args.get(1).context("missing superbundle name")?)?,
         "terrain-chunk-save" => terrain::cmd_terrain_chunk_save(&mut log, &root, args.get(1).context("missing superbundle name")?, args.get(2).context("missing record")?.parse()?)?,
+        "layer-combos" => {
+            // layer-combos <superbundle> [--swap a,b]...
+            let swaps: Vec<(u8, u8)> = args
+                .windows(2)
+                .filter(|w| w[0] == "--swap")
+                .filter_map(|w| w[1].split_once(',').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+                .collect();
+            terrain::cmd_layer_combos(&mut log, &root, args.get(1).context("missing superbundle name")?, &swaps)?
+        }
+        "layer-colours" => terrain::cmd_layer_colours(&mut log, &root, args.get(1).context("missing superbundle name")?, &args[2..])?,
+        "mask-bits" => terrain::cmd_mask_bits(&mut log, &root, args.get(1).context("missing superbundle name")?)?,
         "layer-grid" => {
             // layer-grid <superbundle> <x> <z> <radius m> <step m>
             let num = |i: usize| -> Result<f32> { Ok(args.get(i).context("usage: layer-grid <superbundle> <x> <z> <radius> <step>")?.parse()?) };

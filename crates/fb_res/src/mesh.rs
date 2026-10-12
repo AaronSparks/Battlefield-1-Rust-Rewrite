@@ -274,6 +274,9 @@ pub fn format_size(format: u8) -> Option<usize> {
     })
 }
 
+/// `Geometry::parts` value for vertices of sections without blend indices.
+pub const NO_PART: u8 = u8::MAX;
+
 /// A part of the geometry drawn with one material.
 #[derive(Debug, Clone)]
 pub struct SubMesh {
@@ -296,6 +299,11 @@ pub struct Geometry {
     pub uvs: Vec<[f32; 2]>,
     /// Second texture coordinate set (usage 0x22); empty if no section has one.
     pub uvs1: Vec<[f32; 2]>,
+    /// Mesh part number of each vertex (first byte of the blend indices,
+    /// usage 0x02, format 0x0c); `NO_PART` for sections without them; empty
+    /// if no section has them. On composite meshes the parts are the pieces
+    /// that damage states show or hide (DESIGN.md "damaged parts").
+    pub parts: Vec<u8>,
     pub indices: Vec<u32>,
     pub submeshes: Vec<SubMesh>,
 }
@@ -354,11 +362,15 @@ pub fn decode_lod(lod: &Lod, buffer: &[u8], stats: &mut DecodeStats) -> Result<G
         let normal = d.find(usage::NORMAL).filter(|e| format_size(e.format).is_some());
         let uv = d.find(usage::TEXCOORD0).filter(|e| format_size(e.format).is_some());
         let uv1 = d.find(usage::TEXCOORD1).filter(|e| format_size(e.format).is_some());
+        let blend = d.find(usage::BLEND_INDICES).filter(|e| e.format == 0x0c);
 
         let base = g.positions.len() as u32;
         // A section with a second set after sections without one: pad first.
         if uv1.is_some() && g.uvs1.len() < base as usize {
             g.uvs1.resize(base as usize, [0.0, 0.0]);
+        }
+        if blend.is_some() && g.parts.len() < base as usize {
+            g.parts.resize(base as usize, NO_PART);
         }
         for v in 0..s.vertex_count as usize {
             let p = read(pos, v).with_context(|| format!("position of vertex {v} (format 0x{:02x})", pos.format))?;
@@ -375,6 +387,9 @@ pub fn decode_lod(lod: &Lod, buffer: &[u8], stats: &mut DecodeStats) -> Result<G
                 let t = read(t, v).unwrap_or([0.0; 4]);
                 g.uvs1.push([t[0], t[1]]);
             }
+            if let Some(b) = blend {
+                g.parts.push(read(b, v).map_or(NO_PART, |b| b[0] as u8));
+            }
         }
         // Keep the attribute arrays the same length when some sections lack them.
         if normal.is_none() && !g.normals.is_empty() {
@@ -385,6 +400,9 @@ pub fn decode_lod(lod: &Lod, buffer: &[u8], stats: &mut DecodeStats) -> Result<G
         }
         if !g.uvs1.is_empty() {
             g.uvs1.resize(g.positions.len(), [0.0, 0.0]);
+        }
+        if !g.parts.is_empty() {
+            g.parts.resize(g.positions.len(), NO_PART);
         }
 
         let first = g.indices.len();

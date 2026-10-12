@@ -626,9 +626,164 @@ pub fn apply_volumes(
     log.line(format!("light probes: {} volumes for {} (plain sky light {:.0?} cd/m2)", volumes.baked.len(), env.list[env.current].name, sky));
 }
 
+/// Light probe cache (DESIGN.md "faster start"): the baked boxes, keyed by a
+/// fingerprint of everything the bake reads, in `cache/light_probes.bin`
+/// (git ignores `cache/`).
+pub const CACHE_PATH: &str = "cache/light_probes.bin";
+const CACHE_MAGIC: &[u8; 8] = b"BF1PRB01";
+/// Raise this when the bake code changes in a way the fingerprint cannot
+/// see (the code, not the data or the constants).
+const CACHE_VERSION: u64 = 1;
+
+/// 64-bit FNV-1a over 8-byte words (fast enough for about 60 MB of input).
+struct Fingerprint(u64);
+
+impl Fingerprint {
+    fn new() -> Fingerprint {
+        Fingerprint(0xcbf2_9ce4_8422_2325)
+    }
+    fn word(&mut self, w: u64) {
+        self.0 = (self.0 ^ w).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        let mut chunks = b.chunks_exact(8);
+        for c in &mut chunks {
+            self.word(u64::from_le_bytes(c.try_into().expect("8 bytes")));
+        }
+        let mut tail = [0u8; 8];
+        tail[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
+        self.word(u64::from_le_bytes(tail));
+        self.word(b.len() as u64);
+    }
+    fn f32s(&mut self, v: &[f32]) {
+        for x in v {
+            self.word(x.to_bits() as u64);
+        }
+    }
+}
+
+/// Fingerprint of the bake inputs: code version, probe constants, map
+/// centre, terrain heights, meshes (name, vertices, triangles, cut-out and
+/// decal flags) and placements.
+pub fn fingerprint(level: &Loaded) -> u64 {
+    let mut f = Fingerprint::new();
+    f.word(CACHE_VERSION);
+    f.f32s(&[AREA, COLUMN, TILE, CHUNK, COVER_MIN, COVER_MAX, UNDER_MIN, VOXEL, CELL, RAY_LENGTH, RAY_STEP]);
+    f.word(BLOCK as u64);
+    f.word(RAYS as u64);
+    f.f32s(&level.centre);
+    let t = &level.terrain;
+    f.f32s(&t.min);
+    f.f32s(&t.max);
+    f.f32s(&[t.height_scale]);
+    for tile in &t.tiles {
+        f.word(((tile.level as u64) << 48) | ((tile.ix as u64) << 24) | tile.iz as u64);
+        let bytes: Vec<u8> = tile.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        f.bytes(&bytes);
+    }
+    for m in &level.meshes {
+        f.bytes(m.name.as_bytes());
+        for p in &m.parts {
+            f.word(u64::from(p.texture.is_some_and(|t| level.textures[t].cutout)) | (u64::from(p.decal.is_some()) << 1));
+            for v in &p.positions {
+                f.f32s(v);
+            }
+            let idx: Vec<u8> = p.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+            f.bytes(&idx);
+        }
+    }
+    for (mesh, matrix) in &level.placements {
+        f.word(*mesh as u64);
+        f.f32s(matrix);
+    }
+    f.0
+}
+
+/// The cached boxes if the file exists and its fingerprint matches.
+pub fn load_cache(key: u64) -> Option<Vec<BakedBox>> {
+    decode_cache(key, &std::fs::read(CACHE_PATH).ok()?)
+}
+
+/// Write the baked boxes with their fingerprint.
+pub fn save_cache(key: u64, baked: &[BakedBox]) -> std::io::Result<()> {
+    if let Some(dir) = std::path::Path::new(CACHE_PATH).parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Write a temporary file first, so a stopped run cannot leave half a file.
+    let tmp = format!("{CACHE_PATH}.tmp");
+    std::fs::write(&tmp, encode_cache(key, baked))?;
+    std::fs::rename(&tmp, CACHE_PATH)
+}
+
+/// Cache file contents: magic, key, box count, then per box min, max (f32),
+/// resolution (u32) and the cells' 6 visibility bytes.
+fn decode_cache(key: u64, data: &[u8]) -> Option<Vec<BakedBox>> {
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let s = data.get(at..at + n)?;
+        at += n;
+        Some(s)
+    };
+    if take(8)? != CACHE_MAGIC || u64::from_le_bytes(take(8)?.try_into().ok()?) != key {
+        return None;
+    }
+    let boxes = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    let mut out = Vec::with_capacity(boxes);
+    for _ in 0..boxes {
+        let mut f = [0f32; 6];
+        for v in &mut f {
+            *v = f32::from_le_bytes(take(4)?.try_into().ok()?);
+        }
+        let mut res = [0usize; 3];
+        for r in &mut res {
+            *r = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        }
+        let cells = res[0].checked_mul(res[1])?.checked_mul(res[2])?;
+        let vis = take(cells.checked_mul(6)?)?.chunks_exact(6).map(|c| c.try_into().expect("6 bytes")).collect();
+        out.push(BakedBox { min: Vec3::new(f[0], f[1], f[2]), max: Vec3::new(f[3], f[4], f[5]), res, vis });
+    }
+    Some(out)
+}
+
+fn encode_cache(key: u64, baked: &[BakedBox]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(CACHE_MAGIC);
+    out.extend_from_slice(&key.to_le_bytes());
+    out.extend_from_slice(&(baked.len() as u32).to_le_bytes());
+    for b in baked {
+        for v in [b.min.x, b.min.y, b.min.z, b.max.x, b.max.y, b.max.z] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for r in b.res {
+            out.extend_from_slice(&(r as u32).to_le_bytes());
+        }
+        for c in &b.vis {
+            out.extend_from_slice(c);
+        }
+    }
+    out
+}
+
+/// Whether two sets of baked boxes are the same.
+pub fn same_bake(a: &[BakedBox], b: &[BakedBox]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.min == y.min && x.max == y.max && x.res == y.res && x.vis == y.vis)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_round_trip() {
+        let boxes = vec![
+            BakedBox { min: Vec3::new(1.0, 2.0, 3.0), max: Vec3::new(3.0, 3.0, 4.0), res: [2, 1, 1], vis: vec![[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]] },
+            BakedBox { min: Vec3::ZERO, max: Vec3::ONE, res: [1, 1, 1], vis: vec![[255; 6]] },
+        ];
+        let data = encode_cache(42, &boxes);
+        assert!(decode_cache(42, &data).is_some_and(|b| same_bake(&b, &boxes)));
+        assert!(decode_cache(43, &data).is_none(), "another fingerprint");
+        assert!(decode_cache(42, &data[..data.len() - 1]).is_none(), "cut short");
+    }
 
     #[test]
     fn half_floats() {
