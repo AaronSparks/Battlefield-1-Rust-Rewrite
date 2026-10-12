@@ -2,6 +2,28 @@
 
 Newest entry at the top. One entry per change.
 
+## 2026-10-12: README as a landing page; known issues and tools on their own pages
+
+**Request (user):** the README is too long on GitHub with all the known
+issues; a landing page with a link to a known issues page. A GitHub wiki
+was considered; the user chose pages inside the repository (they stay in
+step with the code and go out with each publish commit).
+
+**Changed (documents only):**
+- New `docs/KNOWN_ISSUES.md`: the README's "What does not work yet" list,
+  moved unchanged, with a short intro (how to report a problem with the I
+  key) and one new item: no sound (the level's 1,703 sound entities are not
+  read).
+- New `docs/TOOLS.md`: the README's "Tools (for developers)" section, moved
+  unchanged, with a note on setting switches in PowerShell.
+- `README.md` (302 to 215 lines): setup, controls and "What works" stay; a
+  short "Known issues" section (5 main items and the link), a one-line
+  "Tools" section with the link, and "More documents" (DESIGN, MODLOG,
+  STATUS, CREDITS).
+- `AGENTS.md` (with the user's OK): the README line now names the landing
+  page; the full list lives in `docs/KNOWN_ISSUES.md`, the switches in
+  `docs/TOOLS.md`.
+
 ## 2026-10-12: README brought up to date
 
 **Request (user):** does the README need updating?

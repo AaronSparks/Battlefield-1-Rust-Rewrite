@@ -54,8 +54,10 @@
   `MODLOG-template.md`.
 - `docs/DESIGN.md`: how the project works, in plain language. Update when the
   architecture changes, not on every commit.
-- `README.md`: the "what works / what doesn't work" list. Test before you claim
-  something works.
+- `README.md`: the landing page and the "what works" list, with a short
+  summary of the main known issues. Test before you claim something works.
+- `docs/KNOWN_ISSUES.md`: the full "what doesn't work" list.
+- `docs/TOOLS.md`: the test switches and the `bf1_probe` tool.
 
 ## Environment
 
