@@ -194,6 +194,12 @@ Tested on build 5142699 (Steam), 2026-10-03:
   props with colour textures and normal maps (surface bumps); the level's
   sky, sun with shadows, fog, bloom and ambient occlusion; about 100 to 200
   frames per second on an RTX 3080 with the game's field of view.
+- Destructible objects show their start state: the pieces that only their
+  damage states show (broken glass, broken planks, scattered hay) are left
+  out, from the objects' own health states (903 placements of 85 meshes;
+  checked by the user).
+- Window and lamp glass (231 placements) is see-through, with the
+  material's own grey colour and opacity.
 
 ## What does not work yet
 
@@ -205,13 +211,18 @@ Tested on build 5142699 (Steam), 2026-10-03:
   layer masks put them, but the blend rule is our assumption, the texture
   repeat size is a guess, and each layer's other textures (variation,
   distance) are not used. The terrain shaders also use textures we do not:
-  a variation mask, a "side flows" normal map (probably for slopes), a
-  cliff detail map and 6 distance normal maps. Tyre tracks: the level has
-  no static ones; the game makes them while vehicles drive (not done). Far away
-  (over about 450 m) the ground uses its colour map, which is a plain
-  grey-brown in about half of the battle area. 10 small
-  mesh parts are still grey (a helmet, a stove, a plane wreck). Wires use a
-  guessed dark colour.
+  a variation mask (soft colour patches, in every shader), a "side flows"
+  normal map (small water channels, with the mud layers), a cliff detail
+  map and 6 distance normal maps. Ground layers 11 and 18 probably have
+  each other's textures (found in two checks, not applied yet; mostly near
+  the map edges). Tyre tracks: the level has no static ones; the game makes
+  them while vehicles drive (not done). Far away (over about 450 m) the
+  ground uses its colour map, which is a plain grey-brown in about half of
+  the battle area. 9 small mesh parts are still grey (4 helmets, 2 stoves,
+  2 plane wreck parts, 1 wallpaper part). Wires use a guessed dark colour.
+- Footprints: in the real game most trench floors show the footprint
+  texture; in our reading of the layer masks it covers only 2 to 3% of the
+  battle area. Not explained yet (STATUS.md, update 10).
 - Damage cards on wooden props are hidden (we think they show only after a
   hit; not confirmed).
 - Decals (dirt, mud, stains, cracks, manhole covers, wall leaks) are drawn
@@ -224,8 +235,8 @@ Tested on build 5142699 (Steam), 2026-10-03:
 - Effects (fire, smoke, dust, falling embers) and the vignette are not drawn
   yet. The sun strength is calibrated against the user's screenshots
   (sun / pi), not taken directly from the data. Interiors are darkened by our
-  own light probe grid (computed at load, about 12 s); lamps are not placed
-  yet.
+  own light probe grid (computed at the first start, about 12 s, then kept
+  in the `cache` folder); lamps are not placed yet.
 - Building detail textures (a second texture set over the repeating
   base) are drawn for the two main building shader families; which set
   goes with which texture is our reading of the data. About 4.5% of the
@@ -242,10 +253,11 @@ Tested on build 5142699 (Steam), 2026-10-03:
   terrain levels; scatter-only layers take their mask from the finest level
   that has them (our reading; `BF1_SCATTER_CARRY=off` for the old way).
   Only one of the card's tree pictures is used.
-- Ivy on the ash trees (47 trees) is placed but drawn about as dark as the
-  bark. A lower cut-out threshold did not help, so the leaves are not cut
-  away; we think the leaves need light through them (not done), but this is
-  not confirmed.
+- Ivy on the ash trees (47 trees) is placed but drawn darker than in the
+  game. The leaves now take their smoothness from their own texture, which
+  helps only a little; the user's reading is that the ivy, the ground
+  foliage and the wet spots on the ground should reflect the sky and sun
+  more. Sky reflections (an environment map) are not done yet.
 - Material tints: only gun paint (with its paint mask) and cloth covers are
   applied (fitted to the user's screenshots). Bare metal is not drawn as
   metal yet. About 30 other tint kinds (trees, houses, walls) are
@@ -260,13 +272,10 @@ Tested on build 5142699 (Steam), 2026-10-03:
   processor prepares every object once per sun shadow step (4 steps), and
   the wide view makes these steps cover much more of the level. The
   graphics card needs only 2 to 3 ms per frame.
-- Destructible objects show their start state: the pieces that only their
-  damage states show (broken glass, broken planks, scattered hay) are left
-  out, from the objects' own health states (903 placements of 85 meshes;
-  checked by the user). Some objects may start damaged in the real game on
-  purpose (`PredestructionEntityData`, not read yet).
-- Window and lamp glass (231 placements) is drawn see-through with the
-  material's grey colour and opacity; its dirt texture is not used yet.
+- Some objects may start damaged in the real game on purpose (29
+  `PredestructionEntityData` in the level, not read yet).
+- The dirt texture of the window glass is not used (its channels are not
+  known).
 - Mounds, dirt piles and ridges (619 placements) take the ground layers
   on faces that point up, by the threshold in their material. This is our
   reading of the game's terrain blend shader (not confirmed); the soft edge

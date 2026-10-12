@@ -2,6 +2,36 @@
 
 Newest entry at the top. One entry per change.
 
+## 2026-10-12: README brought up to date
+
+**Request (user):** does the README need updating?
+
+**Changed (README only):** "What works" now lists the damage-state fix
+(checked by the user) and the see-through glass; their open points stay in
+"What does not work yet". The terrain bullet says what the variation and
+side-flow textures are, notes layers 11 and 18 (found, not applied) and
+gives the grey parts as 9 (the log's count, was "10"). New bullet: the
+footprints (STATUS.md update 10). The light probe grid is cached after the
+first start. The ivy bullet says what was done (smoothness) and what is
+left (sky reflections).
+
+## 2026-10-12: Fourth public release (a new commit on top)
+
+**Request (user):** the GitHub publish commit, the same way as last time.
+
+**What changed:** `publish/`: the 23 files of that commit copied from the
+main folder (4 new: `foliage.rs`, `foliage.wgsl`, `terrain_blend.rs`,
+`terrain_blend.wgsl`). In the `publish/` copy of MODLOG only, the third
+release entry no longer names the private server and its commit ("update
+GitHub" instead). Commit `776bdf0` on top of `63bc34b` (GitHub's current
+`main`, checked with a fetch): author `AaronSparks` with the GitHub private
+address, UTC time, Claude co-author line. Not pushed by Claude.
+
+**Checks (tested by Claude):** personal-data scan of the files and of the
+commit message (names, email addresses, local paths, LAN address, server
+name, keys): nothing found. The `publish/` copy builds by itself and passes
+all 44 tests.
+
 ## 2026-10-11: Damage-state parts hidden at the start (windows looked broken)
 
 **Request (user):** with see-through glass the windows look broken; at the
